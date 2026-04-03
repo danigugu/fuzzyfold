@@ -13,50 +13,12 @@
 
 use std::fmt;
 use nohash_hasher::IntSet;
+use std::hash::{Hash, Hasher};
 
 use crate::PairTable;
 use crate::NAIDX;
 use crate::P1KEY;
-
-
-/// A base pair (i, j) with i < j.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Pair {
-    i: NAIDX,
-    j: NAIDX,
-}
-
-impl Pair {
-    /// Create a new pair (i, j). Panics in debug if i >= j.
-    pub fn new(i: NAIDX, j: NAIDX) -> Self {
-        debug_assert!(i < j);
-        debug_assert!(j < NAIDX::MAX);
-        Pair { i, j }
-    }
-
-    /// Return the 5'-side index.
-    pub fn i(&self) -> NAIDX {
-        self.i
-    }
-
-    /// Return the 3'-side index.
-    pub fn j(&self) -> NAIDX {
-        self.j
-    }
-
-    /// Compact 32-bit key encoding both indices.
-    pub fn key(&self) -> P1KEY {
-        ((self.i as P1KEY) << 16) | (self.j as P1KEY)
-    }
-
-    /// Decode a key back into a `Pair`.
-    pub fn from_key(key: P1KEY) -> Self {
-        let i = (key >> 16) as NAIDX;
-        let j = (key & 0xFFFF) as NAIDX;
-        debug_assert!(i < j);
-        Pair { i, j }
-    }
-}
+use crate::pair::Pair;
 
 /// A collection of base pairs represented as compact integer keys.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -110,6 +72,45 @@ impl PairSet {
     /// Underlying sequence length (from the originating `PairTable`).
     pub fn length(&self) -> usize {
         self.length
+    }
+
+    /// Returns a new PairSet containing only the pairs present in both sets.
+    pub fn intersect(&self, other: &Self) -> Self {
+        // 1. Optimization: Find which set is smaller.
+        // It's faster to loop 10 times and check a set of 1000 
+        // than to loop 1000 times and check a set of 10.
+        let (smaller, larger) = if self.pairs.len() <= other.pairs.len() {
+            (&self.pairs, &other.pairs)
+        } else {
+            (&other.pairs, &self.pairs)
+        };
+
+        // 2. Create a new set. 
+        // Pre-allocating capacity prevents multiple "re-sizes" during the loop.
+        let mut intersected_pairs = IntSet::with_capacity_and_hasher(
+            smaller.len(), 
+            Default::default()
+        );
+
+        // 3. The actual intersection logic
+        for &key in smaller {
+            if larger.contains(&key) {
+                intersected_pairs.insert(key);
+            }
+        }
+
+        Self {
+            length: self.length, // Assumes both structures have same seq length
+            pairs: intersected_pairs,
+        }
+    }
+
+}
+
+impl Hash for PairSet {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.length.hash(state);
+        self.to_vec().hash(state); 
     }
 }
 
@@ -182,4 +183,3 @@ mod tests {
         assert!(s.contains("(1,4)"));
     }
 }
-

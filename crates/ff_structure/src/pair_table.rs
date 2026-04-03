@@ -5,6 +5,7 @@ use std::convert::TryFrom;
 use crate::NAIDX;
 use crate::StructureError;
 use crate::{DotBracket, DotBracketVec};
+use crate::{Constraints, ConstraintsVec};
 
 /// As of v0.1.3 the PairTable field is private. A pair-table should
 /// be constructed by From or TryFrom traits, but then be save to use.
@@ -26,6 +27,11 @@ impl PairTable {
             }
         }
         true
+    }
+
+    // Get entries at specific positions
+    pub fn get(&self, index: &usize) -> Option<NAIDX> {
+        return self[*index];
     }
 }
 
@@ -86,6 +92,35 @@ impl TryFrom<&DotBracketVec> for PairTable {
                 }
                 DotBracket::Unpaired => {}
                 DotBracket::Break => unreachable!("unexpected Break in single-stranded case"),
+            }
+        }
+
+        if let Some(i) = stack.pop() {
+            return Err(StructureError::UnmatchedOpen(i));
+        }
+
+        Ok(PairTable(table))
+    }
+}
+
+impl TryFrom<&ConstraintsVec> for PairTable {
+    type Error = StructureError;
+
+    fn try_from(cv: &ConstraintsVec) -> Result<Self, Self::Error> {
+        let mut stack = Vec::new();
+        let mut table = vec![None; cv.len()];
+
+        for (i, dot) in cv.iter().enumerate() {
+            match dot {
+                Constraints::Unspecified => continue,
+                Constraints::Open => stack.push(i),
+                Constraints::Close => {
+                    let j = stack.pop().ok_or(StructureError::UnmatchedClose(i))?;
+                    table[i] = Some(j as NAIDX);
+                    table[j] = Some(i as NAIDX);
+                }
+                Constraints::Unpaired => {}
+                Constraints::Break => unreachable!("unexpected Break in single-stranded case"),
             }
         }
 
