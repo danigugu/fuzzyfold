@@ -1,8 +1,8 @@
 //use ff_kinetics::Motif;
 use ff_kinetics::MotifRegistry;
-use ff_kinetics::timeline;
 use pyo3::prelude::*;
 use pyo3::exceptions::PyValueError;
+use pyo3::types::{PyDict, PyList};
 
 //use std::collections::HashMap;
 use std::path::PathBuf;
@@ -25,19 +25,9 @@ use ff_energy::parameters::RNA_EXTENDED;
 use ff_energy::parameters::RNA_TURNER_2004;
 use ff_energy::parameters::DNA_MATHEWS_2004;
 
+use rayon::prelude::*;
+
 //TODO: support shifts, rename to arrhenius
-
-#[pyclass]
-pub struct EnsembleResult {
-    #[pyo3(get)]
-    times: Vec<f64>,
-
-    #[pyo3(get)]
-    motifs: Vec<String>,
-
-    #[pyo3(get)]
-    occupancies: std::collections::HashMap<String, Vec<f64>>,
-}
 
 #[pyclass]
 pub struct Simulator {
@@ -310,107 +300,128 @@ impl Simulator {
         start: Option<&str>,
         t_ext: Option<f64>,
         t_end: f64,
-        num_sims: usize
-    ) -> PyResult<EnsembleResult> {
-        let sequence_vec = match self.is_rna {
-            true => NucleotideVec::try_from_rna(sequence)
-                .map_err(|e| PyValueError::new_err(e.to_string()))?,
-            false => NucleotideVec::try_from_dna(sequence)
-                .map_err(|e| PyValueError::new_err(e.to_string()))?,
-        };
-
-        let sequence_arc = Arc::new(sequence_vec);
-
-        let start_db = match start {
-            Some(s) => DotBracketVec::try_from(s)
-                .map_err(|e| PyValueError::new_err(e.to_string()))?,
-            None => DotBracketVec::try_from(".")
-                .map_err(|e| PyValueError::new_err(e.to_string()))?,
-        };
-
-        if start_db.len() < sequence_arc.len() && t_ext.is_none() {
-            return Err(PyValueError::new_err(
-                    "t_ext must be provided when start is shorter than sequence",
-            ));
-        }
-
-        let file_path = PathBuf::from(&motifs_file);
-        let mut motif_reg = MotifRegistry::from((Arc::clone(&sequence_arc), Arc::clone(&self.energy_model)));
-        let _ = motif_reg.insert_from_file(&file_path);
-
-        let times = if let Some(dt) = t_ext {
-            let mut v = vec![dt; sequence_arc.len() - start_db.len()];
-            v.push(t_end);
-            v
-        } else {
-            vec![t_end]
-        };
-
-        let start_pt = PairTable::try_from(&start_db)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-        // Clone the inner NucleotideVec to avoid try_unwrap panic due to motif_reg holding a reference
-        let seq_clone = (*sequence_arc).clone();
-
-        let master_times = times.clone();
-        let motif_reg = Arc::new(motif_reg);
-
-        let timelines: Vec<_> =
-            match (self.rate_model.k3ws().is_some(), self.rate_model.k4ws().is_some()) {
-                (false, false) => build_par_iterator_motif_match(
-                seq_clone,
-                &start_pt,
-                Arc::clone(&self.energy_model),
-                self.rate_model,
-                times,
-                Arc::clone(&motif_reg),
-                num_sims,
-                shift_policy::NoShift,
-                SSAKind::NoShift,
-                ),
-
-                (true, false) => build_par_iterator_motif_match(
-                seq_clone,
-                &start_pt,
-                Arc::clone(&self.energy_model),
-                self.rate_model,
-                times,
-                Arc::clone(&motif_reg),
-                num_sims,
-                shift_policy::ThreeWayOnly,
-                SSAKind::ThreeWayOnly,
-                ),
-
-                (false, true) => build_par_iterator_motif_match(
-                seq_clone,
-                &start_pt,
-                Arc::clone(&self.energy_model),
-                self.rate_model,
-                times,
-                Arc::clone(&motif_reg),
-                num_sims,
-                shift_policy::FourWayOnly,
-                SSAKind::FourWayOnly,
-                ),
-
-                (true, true) => build_par_iterator_motif_match(
-                seq_clone,
-                &start_pt,
-                Arc::clone(&self.energy_model),
-                self.rate_model,
-                times,
-                Arc::clone(&motif_reg),
-                num_sims,
-                shift_policy::ThreeAndFour,
-                SSAKind::ThreeAndFour,
-                ),
+        num_sims: usize,
+    ) -> PyResult<PyObject> {  // return PyObject instead of &PyList
+        Python::with_gil(|py| {  // acquire GIL
+            let sequence_vec = match self.is_rna {
+                true => NucleotideVec::try_from_rna(sequence)
+                    .map_err(|e| PyValueError::new_err(e.to_string()))?,
+                false => NucleotideVec::try_from_dna(sequence)
+                    .map_err(|e| PyValueError::new_err(e.to_string()))?,
             };
-        let mut master = Timeline::new(master_times, Arc::clone(&motif_reg));
-        for timeline in timelines {
-            master.merge(timeline);
-        }
-        return master;
+
+            let sequence_arc = Arc::new(sequence_vec);
+
+            let start_db = match start {
+                Some(s) => DotBracketVec::try_from(s)
+                    .map_err(|e| PyValueError::new_err(e.to_string()))?,
+                None => DotBracketVec::try_from(".")
+                    .map_err(|e| PyValueError::new_err(e.to_string()))?,
+            };
+
+            if start_db.len() < sequence_arc.len() && t_ext.is_none() {
+                return Err(PyValueError::new_err(
+                    "t_ext must be provided when start is shorter than sequence",
+                ));
+            }
+
+            let file_path = PathBuf::from(&motifs_file);
+            let mut motif_reg = MotifRegistry::from((Arc::clone(&sequence_arc), Arc::clone(&self.energy_model)));
+            let _ = motif_reg.insert_from_file(&file_path);
+
+            let times = if let Some(dt) = t_ext {
+                let mut v = vec![dt; sequence_arc.len() - start_db.len()];
+                v.push(t_end);
+                v
+            } else {
+                vec![t_end]
+            };
+
+            let start_pt = PairTable::try_from(&start_db)
+                .map_err(|e| PyValueError::new_err(e.to_string()))?;
+
+            let seq_clone = (*sequence_arc).clone();
+            let master_times = times.clone();
+            let motif_reg = Arc::new(motif_reg);
+
+            let timelines: Vec<_> = match (self.rate_model.k3ws().is_some(), self.rate_model.k4ws().is_some()) {
+                (false, false) => build_par_iterator_motif_match(
+                    seq_clone,
+                    &start_pt,
+                    Arc::clone(&self.energy_model),
+                    self.rate_model,
+                    times,
+                    Arc::clone(&motif_reg),
+                    num_sims,
+                    shift_policy::NoShift,
+                    SSAKind::NoShift,
+                ).unwrap(),
+                (true, false) => build_par_iterator_motif_match(
+                    seq_clone,
+                    &start_pt,
+                    Arc::clone(&self.energy_model),
+                    self.rate_model,
+                    times,
+                    Arc::clone(&motif_reg),
+                    num_sims,
+                    shift_policy::ThreeWayOnly,
+                    SSAKind::ThreeWayOnly,
+                ).unwrap(),
+                (false, true) => build_par_iterator_motif_match(
+                    seq_clone,
+                    &start_pt,
+                    Arc::clone(&self.energy_model),
+                    self.rate_model,
+                    times,
+                    Arc::clone(&motif_reg),
+                    num_sims,
+                    shift_policy::FourWayOnly,
+                    SSAKind::FourWayOnly,
+                ).unwrap(),
+                (true, true) => build_par_iterator_motif_match(
+                    seq_clone,
+                    &start_pt,
+                    Arc::clone(&self.energy_model),
+                    self.rate_model,
+                    times,
+                    Arc::clone(&motif_reg),
+                    num_sims,
+                    shift_policy::ThreeAndFour,
+                    SSAKind::ThreeAndFour,
+                ).unwrap(),
+            };
+
+            let mut master = Timeline::new(master_times, Arc::clone(&motif_reg));
+            for timeline in timelines {
+                master.merge(timeline);
+            }
+
+            // call converter with the GIL token
+            convert_timeline_python_friendly(py, master).map(|list| list.to_object(py))
+        })
     }
+}
+
+fn convert_timeline_python_friendly(
+    py: Python,
+    timeline: Timeline<ViennaRNA>
+) -> PyResult<&PyList> {
+    let py_list = PyList::empty(py);
+
+    for tp in timeline.points {
+        let dict = PyDict::new(py);
+        dict.set_item("time", tp.time)?;
+        dict.set_item("counter", tp.counter)?;
+
+        let ensemble = PyDict::new(py);
+        for (k, v) in tp.ensemble.iter() {
+            ensemble.set_item(k, v)?;
+        }
+        dict.set_item("ensemble", ensemble)?;
+        py_list.append(dict)?;
+    }
+
+    Ok(py_list)
 }
 
 fn build_iterator<P>(
@@ -489,9 +500,9 @@ fn build_par_iterator_motif_match<P>(
     num_sims: usize,
     policy: P,
     wrap: fn(SSA<LoopNeighbors<ViennaRNA, P>, Arrhenius>) -> SSAKind,
-) -> PyResult<Timeline<ViennaRNA>>
+) -> PyResult<Vec<Timeline<ViennaRNA>>>
 where
-    P: shift_policy::ShiftPolicy,
+    P: shift_policy::ShiftPolicy + Send + Sync + Clone + 'static,
 {
     let walker = LoopNeighbors::try_from((
         seq,
@@ -501,31 +512,27 @@ where
     ))
     .map_err(|e| PyValueError::new_err(e.to_string()))?;
 
-    let ssa = wrap(SSA::from((walker, rate_model)));
-
-    (0..num_sims)
+    Ok((0..num_sims)
         .into_par_iter()
         .map_init(
-            move || pb.clone(), // each thread gets a clone
-            move |pb, _| {
-                let mut timeline = Timeline::new(times, motif_registry);
-
-                let sim_res =
-                SimulationEnsembleIteratorMotifMatch {
-                ssa,
-                rng: SmallRng::from_os_rng(),
-                times,
-                elapsed: 0.0,
-                finished: false,
-                motif_registry: registry,
-                timeline: timeline,
-                t_idx: 0
+            move || (times.clone(), motif_registry.clone(), rate_model.clone()),
+            move |(times, motif_registry, rate_model), _| {
+                // let walker = LoopNeighbors::try_from((seq.clone(), start_pt, energy_model.clone(), policy.clone())).unwrap();
+                let mut sim_res = SimulationEnsembleIteratorMotifMatch {
+                    ssa: wrap(SSA::from((walker.clone(), rate_model.clone()))),
+                    rng: SmallRng::from_os_rng(),
+                    times: times.clone(),
+                    elapsed: 0.0,
+                    finished: false,
+                    motif_registry: motif_registry.clone(),
+                    timeline: Timeline::new(times.clone(), motif_registry.clone()),
+                    t_idx: 0,
                 };
 
-            pb.inc(1);
-            sim_res.timeline;
+                sim_res.timeline
             }
         )
+        .collect::<Vec<_>>())
 
 }
 
@@ -711,7 +718,7 @@ pub struct SimulationEnsembleIteratorMotifMatch {
     times: Vec<f64>,
     elapsed: f64,
     finished: bool,
-    motif_registry: MotifRegistry<ViennaRNA>,
+    motif_registry: Arc<MotifRegistry<ViennaRNA>>,
     timeline: Timeline<ViennaRNA>,
     t_idx: usize
 }
@@ -778,7 +785,7 @@ impl SimulationEnsembleIteratorMotifMatch {
         let structure = produced.as_ref()
             .and_then(|(s, ..)| DotBracketVec::try_from(s.as_str()).ok())?;
 
-        this.timeline.assign_structure(t_idx, &structure);
+        this.timeline.assign_structure(this.t_idx, &structure);
         this.t_idx += 1;
 
         let motif_found = !this.motif_registry.classify(&structure).iter().all(|&x| x == 0);

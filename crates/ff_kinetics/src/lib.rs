@@ -8,13 +8,11 @@ pub mod enum_neighbors;
 mod rate_model;
 mod stochastic_simulation;
 mod macrostates_pairlist;
-mod timecourse_motif;
 mod motifs;
 mod movesets;
 
 pub use rate_model::*;
 pub use stochastic_simulation::*;
 pub use macrostates_pairlist::*;
-pub use timecourse_motif::*;
 pub use motifs::*;
 pub use movesets::*;
