@@ -6,7 +6,7 @@ use serde::{Serialize, Deserialize};
 use ff_energy::EnergyModel;
 use crate::timeline::Timeline;
 use crate::timeline::TimelineError;
-use crate::macrostates::MacrostateRegistry;
+use crate::macrostates_pairlist::MacrostateRegistry;
 
 #[derive(Serialize, Deserialize)]
 pub struct SerializableTimeline {

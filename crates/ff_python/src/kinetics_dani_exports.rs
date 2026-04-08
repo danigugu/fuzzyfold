@@ -1,5 +1,6 @@
 //use ff_kinetics::Motif;
 use ff_kinetics::MotifRegistry;
+use ff_kinetics::timeline;
 use pyo3::prelude::*;
 use pyo3::exceptions::PyValueError;
 
@@ -18,11 +19,25 @@ use ff_kinetics::shift_policy;
 use ff_kinetics::Arrhenius;
 use ff_kinetics::Walker;
 use ff_kinetics::LoopNeighbors;
+use ff_kinetics::timeline_motif::Timepoint;
+use ff_kinetics::timeline_motif::Timeline;
 use ff_energy::parameters::RNA_EXTENDED;
 use ff_energy::parameters::RNA_TURNER_2004;
 use ff_energy::parameters::DNA_MATHEWS_2004;
 
 //TODO: support shifts, rename to arrhenius
+
+#[pyclass]
+pub struct EnsembleResult {
+    #[pyo3(get)]
+    times: Vec<f64>,
+
+    #[pyo3(get)]
+    motifs: Vec<String>,
+
+    #[pyo3(get)]
+    occupancies: std::collections::HashMap<String, Vec<f64>>,
+}
 
 #[pyclass]
 pub struct Simulator {
@@ -184,7 +199,7 @@ impl Simulator {
             t_ext=None,
             t_end=1.0,
     ))]
-   fn simulate_to_target_motif(
+   fn simulate_to_target_motifs(
         &self,
         sequence: &str,
         motifs_file: &str,
@@ -279,6 +294,123 @@ impl Simulator {
             ),
         }
    }
+
+   #[pyo3(signature = (
+        sequence,
+        motifs_file,
+        start=None,
+        t_ext=None,
+        t_end=1.0,
+        num_sims=100
+    ))]
+    fn simulate_ensemble_to_target_motifs(
+        &self,
+        sequence: &str,
+        motifs_file: &str,
+        start: Option<&str>,
+        t_ext: Option<f64>,
+        t_end: f64,
+        num_sims: usize
+    ) -> PyResult<EnsembleResult> {
+        let sequence_vec = match self.is_rna {
+            true => NucleotideVec::try_from_rna(sequence)
+                .map_err(|e| PyValueError::new_err(e.to_string()))?,
+            false => NucleotideVec::try_from_dna(sequence)
+                .map_err(|e| PyValueError::new_err(e.to_string()))?,
+        };
+
+        let sequence_arc = Arc::new(sequence_vec);
+
+        let start_db = match start {
+            Some(s) => DotBracketVec::try_from(s)
+                .map_err(|e| PyValueError::new_err(e.to_string()))?,
+            None => DotBracketVec::try_from(".")
+                .map_err(|e| PyValueError::new_err(e.to_string()))?,
+        };
+
+        if start_db.len() < sequence_arc.len() && t_ext.is_none() {
+            return Err(PyValueError::new_err(
+                    "t_ext must be provided when start is shorter than sequence",
+            ));
+        }
+
+        let file_path = PathBuf::from(&motifs_file);
+        let mut motif_reg = MotifRegistry::from((Arc::clone(&sequence_arc), Arc::clone(&self.energy_model)));
+        let _ = motif_reg.insert_from_file(&file_path);
+
+        let times = if let Some(dt) = t_ext {
+            let mut v = vec![dt; sequence_arc.len() - start_db.len()];
+            v.push(t_end);
+            v
+        } else {
+            vec![t_end]
+        };
+
+        let start_pt = PairTable::try_from(&start_db)
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+
+        // Clone the inner NucleotideVec to avoid try_unwrap panic due to motif_reg holding a reference
+        let seq_clone = (*sequence_arc).clone();
+
+        let master_times = times.clone();
+        let motif_reg = Arc::new(motif_reg);
+
+        let timelines: Vec<_> =
+            match (self.rate_model.k3ws().is_some(), self.rate_model.k4ws().is_some()) {
+                (false, false) => build_par_iterator_motif_match(
+                seq_clone,
+                &start_pt,
+                Arc::clone(&self.energy_model),
+                self.rate_model,
+                times,
+                Arc::clone(&motif_reg),
+                num_sims,
+                shift_policy::NoShift,
+                SSAKind::NoShift,
+                ),
+
+                (true, false) => build_par_iterator_motif_match(
+                seq_clone,
+                &start_pt,
+                Arc::clone(&self.energy_model),
+                self.rate_model,
+                times,
+                Arc::clone(&motif_reg),
+                num_sims,
+                shift_policy::ThreeWayOnly,
+                SSAKind::ThreeWayOnly,
+                ),
+
+                (false, true) => build_par_iterator_motif_match(
+                seq_clone,
+                &start_pt,
+                Arc::clone(&self.energy_model),
+                self.rate_model,
+                times,
+                Arc::clone(&motif_reg),
+                num_sims,
+                shift_policy::FourWayOnly,
+                SSAKind::FourWayOnly,
+                ),
+
+                (true, true) => build_par_iterator_motif_match(
+                seq_clone,
+                &start_pt,
+                Arc::clone(&self.energy_model),
+                self.rate_model,
+                times,
+                Arc::clone(&motif_reg),
+                num_sims,
+                shift_policy::ThreeAndFour,
+                SSAKind::ThreeAndFour,
+                ),
+            };
+        let mut master = Timeline::new(master_times, Arc::clone(&motif_reg));
+        for timeline in timelines {
+            master.merge(timeline);
+        }
+        return master;
+    }
 }
 
 fn build_iterator<P>(
@@ -345,6 +477,56 @@ where
         finished: false,
         motif_registry: motif_registry,
     })
+}
+
+fn build_par_iterator_motif_match<P>(
+    seq: NucleotideVec,
+    start_pt: &PairTable,
+    energy_model: Arc<ViennaRNA>,
+    rate_model: Arrhenius,
+    times: Vec<f64>,
+    motif_registry: Arc<MotifRegistry<ViennaRNA>>,
+    num_sims: usize,
+    policy: P,
+    wrap: fn(SSA<LoopNeighbors<ViennaRNA, P>, Arrhenius>) -> SSAKind,
+) -> PyResult<Timeline<ViennaRNA>>
+where
+    P: shift_policy::ShiftPolicy,
+{
+    let walker = LoopNeighbors::try_from((
+        seq,
+        start_pt,
+        energy_model,
+        policy,
+    ))
+    .map_err(|e| PyValueError::new_err(e.to_string()))?;
+
+    let ssa = wrap(SSA::from((walker, rate_model)));
+
+    (0..num_sims)
+        .into_par_iter()
+        .map_init(
+            move || pb.clone(), // each thread gets a clone
+            move |pb, _| {
+                let mut timeline = Timeline::new(times, motif_registry);
+
+                let sim_res =
+                SimulationEnsembleIteratorMotifMatch {
+                ssa,
+                rng: SmallRng::from_os_rng(),
+                times,
+                elapsed: 0.0,
+                finished: false,
+                motif_registry: registry,
+                timeline: timeline,
+                t_idx: 0
+                };
+
+            pb.inc(1);
+            sim_res.timeline;
+            }
+        )
+
 }
 
 enum SSAKind {
@@ -510,6 +692,98 @@ impl SimulationIteratorMotifMatch {
         let motif_found = !this.motif_registry.classify(&structure).iter().all(|&x| x == 0);
 
         if (this.times[0] - mytinc).abs() < f64::EPSILON || motif_found {
+            this.times.remove(0); 
+            if this.times.is_empty() || motif_found {
+                this.finished = true;
+            }
+        } else {
+            assert!(this.times[0] > mytinc);
+            this.times[0] -= mytinc;
+        }
+        produced
+    }
+}
+
+#[pyclass]
+pub struct SimulationEnsembleIteratorMotifMatch {
+    ssa: SSAKind,
+    rng: SmallRng,
+    times: Vec<f64>,
+    elapsed: f64,
+    finished: bool,
+    motif_registry: MotifRegistry<ViennaRNA>,
+    timeline: Timeline<ViennaRNA>,
+    t_idx: usize
+}
+
+#[pymethods]
+impl SimulationEnsembleIteratorMotifMatch {
+
+    fn __iter__(slf: PyRef<Self>) -> PyRef<Self> {
+        slf
+    }
+
+    fn __next__(
+        mut slf: PyRefMut<Self>
+    ) -> Option<(String, i32, f64, f64, f64)> {
+
+        let this: &mut Self = &mut slf;
+
+        if this.finished {
+            return None;
+        }
+
+        let mut produced: Option<(String, i32, f64, f64, f64)> = None;
+
+        let rng = &mut this.rng;
+        let mut mytinc = 0.0;
+        let mut first_pass = true;
+
+        macro_rules! dispatch_ssa {
+            ($ssa:expr) => {{
+                $ssa.co_simulate(
+                    rng,
+                    &this.times,
+                    |t, tinc, flux, w| {
+                        if first_pass {
+                            mytinc = tinc.min(this.times[0]);
+
+                            produced = Some((
+                                    w.to_string(),
+                                    w.current_energy(),
+                                    this.elapsed + t,
+                                    mytinc,
+                                    flux,
+                            ));
+
+                            this.elapsed += mytinc;
+                            first_pass = false;
+                            // advance the simulator to update the structure.
+                            true
+                        } else {
+                            false
+                        }
+                    },
+                    );
+            }};
+        }
+
+        match &mut this.ssa {
+            SSAKind::NoShift(ssa) => dispatch_ssa!(ssa),
+            SSAKind::ThreeWayOnly(ssa) => dispatch_ssa!(ssa),
+            SSAKind::FourWayOnly(ssa) => dispatch_ssa!(ssa),
+            SSAKind::ThreeAndFour(ssa) => dispatch_ssa!(ssa),
+        }
+        
+        let structure = produced.as_ref()
+            .and_then(|(s, ..)| DotBracketVec::try_from(s.as_str()).ok())?;
+
+        this.timeline.assign_structure(t_idx, &structure);
+        this.t_idx += 1;
+
+        let motif_found = !this.motif_registry.classify(&structure).iter().all(|&x| x == 0);
+
+        if (this.times[0] - mytinc).abs() < f64::EPSILON{
             this.times.remove(0); 
             if this.times.is_empty() || motif_found {
                 this.finished = true;

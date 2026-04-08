@@ -5,7 +5,7 @@ use ff_energy::EnergyModel;
 use nohash_hasher::IntMap;
 use ff_structure::DotBracketVec; 
 
-use crate::macrostates_pairlist::MacrostateRegistry;
+use crate::motifs::MotifRegistry;
 
 #[derive(Debug)]
 pub enum TimelineError {
@@ -73,9 +73,11 @@ impl Timepoint {
     }
 
     /// Add a count for the given macrostate index
-    pub fn add(&mut self, macro_idx: usize) {
-        *self.ensemble.entry(macro_idx).or_insert(0) += 1;
-        self.counter += 1;
+    pub fn add(&mut self, macro_indices: Vec<usize>) {
+        for idx in macro_indices {
+            *self.ensemble.entry(idx).or_insert(0) += 1;
+            self.counter += 1;
+        }
     }
 
     /// Get the count for a specific macrostate (or 0 if not present)
@@ -99,17 +101,17 @@ impl Timepoint {
 
 }
 
-pub struct Timeline<'a, E: EnergyModel> {
+pub struct Timeline<E: EnergyModel> {
     /// Registry of all macrostates (used to classify structures)
-    pub registry: Arc<MacrostateRegistry<'a, E>>,
+    pub registry: Arc<MotifRegistry<E>>,
 
     /// One `Timepoint` per output time in the simulation
     pub points: Vec<Timepoint>,
 }
 
-impl<'a, E: EnergyModel> Timeline<'a, E> {
+impl<'a, E: EnergyModel> Timeline<E> {
     /// Build a new empty timeline for given times and an existing macrostate registry.
-    pub fn new(times: &[f64], registry: Arc<MacrostateRegistry<'a, E>>) -> Self {
+    pub fn new(times: Vec<f64>, registry: Arc<MotifRegistry<E>>) -> Self {
         let points = times.iter().map(|&t| Timepoint::new(t)).collect();
         Self { registry, points }
     }
@@ -131,7 +133,7 @@ impl<'a, E: EnergyModel> Timeline<'a, E> {
         self.points.iter().enumerate()
     }
 
-    pub fn merge(&mut self, other: Timeline<'a, E>) {
+    pub fn merge(&mut self, other: Timeline<E>) {
         assert!(
             Arc::ptr_eq(&self.registry, &other.registry),
             "Cannot merge timelines with different registries"
@@ -148,7 +150,7 @@ impl<'a, E: EnergyModel> Timeline<'a, E> {
     }
 }
 
-impl<'a, E: EnergyModel> fmt::Display for Timeline<'a, E> {
+impl<'a, E: EnergyModel> fmt::Display for Timeline<E> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // DRF header
         writeln!(f, "{:>13} {:>5} {:>12} {:>10} {:>25}", "time", "id", "occupancy", "energy", "macrostate")?;
@@ -161,8 +163,8 @@ impl<'a, E: EnergyModel> fmt::Display for Timeline<'a, E> {
 
             // Sort by energy, None last
             entries.sort_by(|(a_idx, _), (b_idx, _)| {
-                let e_a = self.registry.macrostates()[*a_idx].ensemble_energy();
-                let e_b = self.registry.macrostates()[*b_idx].ensemble_energy(); 
+                let e_a = self.registry.macrostates()[*a_idx].energy();
+                let e_b = self.registry.macrostates()[*b_idx].energy(); 
                 e_a.partial_cmp(&e_b).unwrap_or(std::cmp::Ordering::Equal)
             });
 
@@ -171,7 +173,7 @@ impl<'a, E: EnergyModel> fmt::Display for Timeline<'a, E> {
                 let occu = count as f64 / total as f64;
 
                 let name = self.registry.macrostates()[m_idx].name();
-                let energy = self.registry.macrostates()[m_idx].ensemble_energy().unwrap_or(0.0);
+                let energy = self.registry.macrostates()[m_idx].energy().unwrap_or(0.0);
 
                 writeln!(
                     f,
