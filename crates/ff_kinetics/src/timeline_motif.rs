@@ -76,8 +76,8 @@ impl Timepoint {
     pub fn add(&mut self, macro_indices: Vec<usize>) {
         for idx in macro_indices {
             *self.ensemble.entry(idx).or_insert(0) += 1;
-            self.counter += 1;
         }
+        self.counter += 1;
     }
 
     /// Get the count for a specific macrostate (or 0 if not present)

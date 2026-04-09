@@ -4,6 +4,7 @@ use pyo3::prelude::*;
 use pyo3::exceptions::PyValueError;
 use pyo3::types::{PyDict, PyList};
 
+use core::num;
 //use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -222,7 +223,8 @@ impl Simulator {
 
         let file_path = PathBuf::from(&motifs_file);
         let mut motif_reg = MotifRegistry::from((Arc::clone(&sequence_arc), Arc::clone(&self.energy_model)));
-        let _ = motif_reg.insert_from_file(&file_path);
+        motif_reg.insert_from_file(&file_path)
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
 
         let times = if let Some(dt) = t_ext {
             let mut v = vec![dt; sequence_arc.len() - start_db.len()];
@@ -327,7 +329,8 @@ impl Simulator {
 
             let file_path = PathBuf::from(&motifs_file);
             let mut motif_reg = MotifRegistry::from((Arc::clone(&sequence_arc), Arc::clone(&self.energy_model)));
-            let _ = motif_reg.insert_from_file(&file_path);
+            motif_reg.insert_from_file(&file_path)
+                .map_err(|e| PyValueError::new_err(e.to_string()))?;
 
             let times = if let Some(dt) = t_ext {
                 let mut v = vec![dt; sequence_arc.len() - start_db.len()];
@@ -341,8 +344,30 @@ impl Simulator {
                 .map_err(|e| PyValueError::new_err(e.to_string()))?;
 
             let seq_clone = (*sequence_arc).clone();
-            let master_times = times.clone();
+            let master_times: Vec<f64> = times
+                .iter()
+                .scan(0.0, |acc, &dt| {
+                    *acc += dt;
+                    Some(*acc)
+                })
+                .collect();
             let motif_reg = Arc::new(motif_reg);
+
+            let init_struc = match start {
+                Some(s) => DotBracketVec::try_from(s).unwrap(),
+                None => DotBracketVec::try_from(".").unwrap(),
+            };
+
+            if !motif_reg
+                .classify(&init_struc)
+                .iter()
+                .all(|&x| x == 0) {
+                    let mut master = Timeline::new(master_times, Arc::clone(&motif_reg));
+                    for i in 0..num_sims {
+                        master.assign_structure(0, &init_struc);
+                    }
+                    return convert_timeline_python_friendly(py, master).map(|list| list.to_object(py))
+                }
 
             let timelines: Vec<_> = match (self.rate_model.k3ws().is_some(), self.rate_model.k4ws().is_some()) {
                 (false, false) => build_par_iterator_motif_match(
@@ -396,8 +421,15 @@ impl Simulator {
                 master.merge(timeline);
             }
 
-            // call converter with the GIL token
-            convert_timeline_python_friendly(py, master).map(|list| list.to_object(py))
+            master.points.insert(0, Timepoint::new(0.0));
+            let init_struc = match start {
+                Some(s) => DotBracketVec::try_from(s).unwrap(),
+                None => DotBracketVec::try_from(".").unwrap(),
+            };
+            for i in 0..num_sims {
+                master.assign_structure(0, &init_struc);
+            }
+            return convert_timeline_python_friendly(py, master).map(|list| list.to_object(py))
         })
     }
 }
@@ -512,6 +544,14 @@ where
     ))
     .map_err(|e| PyValueError::new_err(e.to_string()))?;
 
+    let master_times: Vec<f64> = times
+        .iter()
+        .scan(0.0, |acc, &dt| {
+            *acc += dt;
+            Some(*acc)
+        })
+        .collect();
+
     Ok((0..num_sims)
         .into_par_iter()
         .map_init(
@@ -525,9 +565,11 @@ where
                     elapsed: 0.0,
                     finished: false,
                     motif_registry: motif_registry.clone(),
-                    timeline: Timeline::new(times.clone(), motif_registry.clone()),
+                    timeline: Timeline::new(master_times.clone(), motif_registry.clone()),
                     t_idx: 0,
                 };
+
+                while let Some(_) = sim_res.next() {}
 
                 sim_res.timeline
             }
@@ -723,26 +765,18 @@ pub struct SimulationEnsembleIteratorMotifMatch {
     t_idx: usize
 }
 
-#[pymethods]
-impl SimulationEnsembleIteratorMotifMatch {
+impl Iterator for SimulationEnsembleIteratorMotifMatch {
+    type Item = (String, i32, f64, f64, f64);
 
-    fn __iter__(slf: PyRef<Self>) -> PyRef<Self> {
-        slf
-    }
-
-    fn __next__(
-        mut slf: PyRefMut<Self>
-    ) -> Option<(String, i32, f64, f64, f64)> {
-
-        let this: &mut Self = &mut slf;
-
-        if this.finished {
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.finished {
             return None;
         }
 
+
         let mut produced: Option<(String, i32, f64, f64, f64)> = None;
 
-        let rng = &mut this.rng;
+        let rng = &mut self.rng;
         let mut mytinc = 0.0;
         let mut first_pass = true;
 
@@ -750,55 +784,72 @@ impl SimulationEnsembleIteratorMotifMatch {
             ($ssa:expr) => {{
                 $ssa.co_simulate(
                     rng,
-                    &this.times,
+                    &self.times,
                     |t, tinc, flux, w| {
                         if first_pass {
-                            mytinc = tinc.min(this.times[0]);
+                            mytinc = tinc.min(self.times[0]);
 
                             produced = Some((
-                                    w.to_string(),
-                                    w.current_energy(),
-                                    this.elapsed + t,
-                                    mytinc,
-                                    flux,
+                                w.to_string(),
+                                w.current_energy(),
+                                self.elapsed + t,
+                                mytinc,
+                                flux,
                             ));
 
-                            this.elapsed += mytinc;
+                            self.elapsed += mytinc;
                             first_pass = false;
-                            // advance the simulator to update the structure.
                             true
                         } else {
                             false
                         }
                     },
-                    );
+                );
             }};
         }
 
-        match &mut this.ssa {
+        match &mut self.ssa {
             SSAKind::NoShift(ssa) => dispatch_ssa!(ssa),
             SSAKind::ThreeWayOnly(ssa) => dispatch_ssa!(ssa),
             SSAKind::FourWayOnly(ssa) => dispatch_ssa!(ssa),
             SSAKind::ThreeAndFour(ssa) => dispatch_ssa!(ssa),
         }
-        
-        let structure = produced.as_ref()
+
+        let structure = produced
+            .as_ref()
             .and_then(|(s, ..)| DotBracketVec::try_from(s.as_str()).ok())?;
 
-        this.timeline.assign_structure(this.t_idx, &structure);
-        this.t_idx += 1;
+        let motif_found = !self
+            .motif_registry
+            .classify(&structure)
+            .iter()
+            .all(|&x| x == 0);
 
-        let motif_found = !this.motif_registry.classify(&structure).iter().all(|&x| x == 0);
 
-        if (this.times[0] - mytinc).abs() < f64::EPSILON{
-            this.times.remove(0); 
-            if this.times.is_empty() || motif_found {
-                this.finished = true;
+        if (self.times[0] - mytinc).abs() < f64::EPSILON {
+            self.timeline.assign_structure(self.t_idx, &structure);
+            self.t_idx += 1;
+
+            self.times.remove(0);
+            if self.times.is_empty() || motif_found{
+                self.finished = true;
             }
         } else {
-            assert!(this.times[0] > mytinc);
-            this.times[0] -= mytinc;
+            self.times[0] -= mytinc;
         }
+
         produced
+    }
+}
+
+#[pymethods]
+impl SimulationEnsembleIteratorMotifMatch {
+
+    fn __iter__(slf: PyRef<Self>) -> PyRef<Self> {
+        slf
+    }
+
+    fn __next__(mut slf: PyRefMut<Self>) -> Option<(String, i32, f64, f64, f64)> {
+        slf.next()
     }
 }
