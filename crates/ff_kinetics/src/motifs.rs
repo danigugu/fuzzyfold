@@ -171,16 +171,23 @@ impl<E: EnergyModel> MotifRegistry<E> {
     pub fn insert_from_reader<R: BufRead>(&mut self, reader: R, source: &str) -> io::Result<()> {
         let mut lines = reader.lines();
 
-        // Read the sequence line first
-        let seq_line = lines
-            .next()
-            .ok_or_else(|| io_err("Missing sequence line", source))??
-            .trim()
-            .to_string();
+        let mut seq_line = String::new();
+        while let Some(line_res) = lines.next() {
+            let l = line_res?.trim().to_string();
+            if !l.is_empty() {
+                seq_line = l;
+                break;
+            }
+        }
 
-        // Parse sequence
+        if seq_line.is_empty() {
+            return Err(io_err("File is empty or contains only whitespace", source));
+        }
+
+        // 2. Parse the sequence (same as before)
         let file_seq = NucleotideVec::try_from(seq_line.as_str())
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        
         if &file_seq != self.sequence.as_ref() {
             return Err(io_err("Sequence does not match input sequence", source));
         }

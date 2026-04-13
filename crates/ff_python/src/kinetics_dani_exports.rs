@@ -10,6 +10,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use rand::SeedableRng;
 use rand::rngs::SmallRng;
+use std::path::Path;
+use std::io::Cursor;
+use std::io::{self, Write};
 
 use ff_structure::DotBracketVec;
 use ff_structure::PairTable;
@@ -220,11 +223,20 @@ impl Simulator {
                     "t_ext must be provided when start is shorter than sequence",
             ));
         }
+        
+        let path = Path::new(&motifs_file);
 
-        let file_path = PathBuf::from(&motifs_file);
         let mut motif_reg = MotifRegistry::from((Arc::clone(&sequence_arc), Arc::clone(&self.energy_model)));
-        motif_reg.insert_from_file(&file_path)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+
+        if path.exists() && path.is_file() {
+            // It's a valid file path
+            let file_path = PathBuf::from(&motifs_file);
+            motif_reg.insert_from_file(&file_path)
+                .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        } else {
+            // It's not a file; treat 'motifs_file' as raw content or a string identifier
+            motif_reg.insert_from_reader(Cursor::new(motifs_file), "manual").unwrap();
+        }
 
         let times = if let Some(dt) = t_ext {
             let mut v = vec![dt; sequence_arc.len() - start_db.len()];
@@ -327,10 +339,23 @@ impl Simulator {
                 ));
             }
 
-            let file_path = PathBuf::from(&motifs_file);
+            io::stdout().flush().unwrap();
+            let path = Path::new(&motifs_file);
+            io::stdout().flush().unwrap();
+
             let mut motif_reg = MotifRegistry::from((Arc::clone(&sequence_arc), Arc::clone(&self.energy_model)));
-            motif_reg.insert_from_file(&file_path)
-                .map_err(|e| PyValueError::new_err(e.to_string()))?;
+
+            if path.exists() && path.is_file() {
+                io::stdout().flush().unwrap();
+                // It's a valid file path
+                let file_path = PathBuf::from(&motifs_file);
+                motif_reg.insert_from_file(&file_path)
+                    .map_err(|e| PyValueError::new_err(e.to_string()))?;
+            } else {
+                io::stdout().flush().unwrap();
+                // It's not a file; treat 'motifs_file' as raw content or a string identifier
+                motif_reg.insert_from_reader(Cursor::new(motifs_file), "manual").unwrap();
+            }
 
             let times = if let Some(dt) = t_ext {
                 let mut v = vec![dt; sequence_arc.len() - start_db.len()];
