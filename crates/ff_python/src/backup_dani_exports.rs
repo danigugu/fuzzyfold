@@ -4,7 +4,7 @@ use pyo3::prelude::*;
 use pyo3::exceptions::PyValueError;
 use pyo3::types::{PyDict, PyList};
 
-// use core::num;
+use core::num;
 //use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -12,7 +12,7 @@ use rand::SeedableRng;
 use rand::rngs::SmallRng;
 use std::path::Path;
 use std::io::Cursor;
-// use std::io::{self, Write};
+use std::io::{self, Write};
 
 use ff_structure::DotBracketVec;
 use ff_structure::PairTable;
@@ -29,7 +29,7 @@ use ff_energy::parameters::RNA_EXTENDED;
 use ff_energy::parameters::RNA_TURNER_2004;
 use ff_energy::parameters::DNA_MATHEWS_2004;
 
-// use rayon::prelude::*;
+use rayon::prelude::*;
 
 //TODO: support shifts, rename to arrhenius
 
@@ -39,6 +39,7 @@ pub struct Simulator {
     rate_model: Arrhenius,
     is_rna: bool,
 }
+
 
 #[pymethods]
 impl Simulator {
@@ -186,6 +187,119 @@ impl Simulator {
    }
 
    #[pyo3(signature = (
+            sequence,
+            motifs_file,
+            start=None,
+            t_ext=None,
+            t_end=1.0,
+    ))]
+   fn simulate_to_target_motifs(
+        &self,
+        sequence: &str,
+        motifs_file: &str,
+        start: Option<&str>,
+        t_ext: Option<f64>,
+        t_end: f64,
+    ) -> PyResult<SimulationIteratorMotifMatch> {
+
+        let sequence_vec = match self.is_rna {
+            true => NucleotideVec::try_from_rna(sequence)
+                .map_err(|e| PyValueError::new_err(e.to_string()))?,
+            false => NucleotideVec::try_from_dna(sequence)
+                .map_err(|e| PyValueError::new_err(e.to_string()))?,
+        };
+
+        let sequence_arc = Arc::new(sequence_vec);
+
+        let start_db = match start {
+            Some(s) => DotBracketVec::try_from(s)
+                .map_err(|e| PyValueError::new_err(e.to_string()))?,
+            None => DotBracketVec::try_from(".")
+                .map_err(|e| PyValueError::new_err(e.to_string()))?,
+        };
+
+        if start_db.len() < sequence_arc.len() && t_ext.is_none() {
+            return Err(PyValueError::new_err(
+                    "t_ext must be provided when start is shorter than sequence",
+            ));
+        }
+        
+        let path = Path::new(&motifs_file);
+
+        let mut motif_reg = MotifRegistry::from((Arc::clone(&sequence_arc), Arc::clone(&self.energy_model)));
+
+        if path.exists() && path.is_file() {
+            // It's a valid file path
+            let file_path = PathBuf::from(&motifs_file);
+            motif_reg.insert_from_file(&file_path)
+                .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        } else {
+            // It's not a file; treat 'motifs_file' as raw content or a string identifier
+            motif_reg.insert_from_reader(Cursor::new(motifs_file), "manual").unwrap();
+        }
+
+        let times = if let Some(dt) = t_ext {
+            let mut v = vec![dt; sequence_arc.len() - start_db.len()];
+            v.push(t_end);
+            v
+        } else {
+            vec![t_end]
+        };
+
+        let start_pt = PairTable::try_from(&start_db)
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+
+        // Clone the inner NucleotideVec to avoid try_unwrap panic due to motif_reg holding a reference
+        let seq_clone = (*sequence_arc).clone();
+
+        match (self.rate_model.k3ws().is_some(), self.rate_model.k4ws().is_some()) {
+            (false, false) => build_iterator_motif_match(
+                seq_clone,
+                &start_pt,
+                Arc::clone(&self.energy_model),
+                self.rate_model,
+                times,
+                motif_reg,
+                shift_policy::NoShift,
+                SSAKind::NoShift,
+            ),
+
+            (true, false) => build_iterator_motif_match(
+                seq_clone,
+                &start_pt,
+                Arc::clone(&self.energy_model),
+                self.rate_model,
+                times,
+                motif_reg,
+                shift_policy::ThreeWayOnly,
+                SSAKind::ThreeWayOnly,
+            ),
+
+            (false, true) => build_iterator_motif_match(
+                seq_clone,
+                &start_pt,
+                Arc::clone(&self.energy_model),
+                self.rate_model,
+                times,
+                motif_reg,
+                shift_policy::FourWayOnly,
+                SSAKind::FourWayOnly,
+            ),
+
+            (true, true) => build_iterator_motif_match(
+                seq_clone,
+                &start_pt,
+                Arc::clone(&self.energy_model),
+                self.rate_model,
+                times,
+                motif_reg,
+                shift_policy::ThreeAndFour,
+                SSAKind::ThreeAndFour,
+            ),
+        }
+   }
+
+   #[pyo3(signature = (
         sequence,
         motifs_file,
         start=None,
@@ -193,7 +307,7 @@ impl Simulator {
         t_end=1.0,
         num_sims=100
     ))]
-    fn simulate_ensemble_motif_timecourse(
+    fn simulate_ensemble_timecourse_motifs(
         &self,
         sequence: &str,
         motifs_file: &str,
@@ -262,8 +376,22 @@ impl Simulator {
                 None => DotBracketVec::try_from(".").unwrap(),
             };
 
+            // If the given start structure already belongs to a motif
+            //if !motif_reg
+            //    .classify(&init_struc)
+            //    .iter()
+            //    .all(|&x| x == 0) {
+            //        let mut master_timeline = Timeline::new(master_timeline_times, Arc::clone(&motif_reg));
+            //        master_timeline.points.insert(0, Timepoint::new(0.0));
+            //        
+            //        for i in 0..num_sims {
+            //            master_timeline.assign_structure(0, &init_struc);
+            //        }
+            //        return convert_timeline_python_friendly(py, master_timeline).map(|list| list.to_object(py))
+            //    }
+
             let timelines: Vec<_> = match (self.rate_model.k3ws().is_some(), self.rate_model.k4ws().is_some()) {
-                (false, false) => build_parallel_runs_motif_timecourse(
+                (false, false) => build_par_iterator_motif_match(
                     seq_clone,
                     &start_pt,
                     Arc::clone(&self.energy_model),
@@ -274,7 +402,7 @@ impl Simulator {
                     shift_policy::NoShift,
                     SSAKind::NoShift,
                 ).unwrap(),
-                (true, false) => build_parallel_runs_motif_timecourse(
+                (true, false) => build_par_iterator_motif_match(
                     seq_clone,
                     &start_pt,
                     Arc::clone(&self.energy_model),
@@ -285,7 +413,7 @@ impl Simulator {
                     shift_policy::ThreeWayOnly,
                     SSAKind::ThreeWayOnly,
                 ).unwrap(),
-                (false, true) => build_parallel_runs_motif_timecourse(
+                (false, true) => build_par_iterator_motif_match(
                     seq_clone,
                     &start_pt,
                     Arc::clone(&self.energy_model),
@@ -296,7 +424,7 @@ impl Simulator {
                     shift_policy::FourWayOnly,
                     SSAKind::FourWayOnly,
                 ).unwrap(),
-                (true, true) => build_parallel_runs_motif_timecourse(
+                (true, true) => build_par_iterator_motif_match(
                     seq_clone,
                     &start_pt,
                     Arc::clone(&self.energy_model),
@@ -316,13 +444,12 @@ impl Simulator {
 
             master_timeline.points.insert(0, Timepoint::new(0.0));
 
-            for _i in 0..num_sims {
+            for i in 0..num_sims {
                 master_timeline.assign_structure(0, &init_struc);
             }
             return convert_timeline_python_friendly(py, master_timeline).map(|list| list.to_object(py))
         })
     }
-
 
 
     #[pyo3(signature = (
@@ -368,10 +495,12 @@ impl Simulator {
             let path = Path::new(&motifs_file);
 
             if path.exists() && path.is_file() {
+                // It's a valid file path
                 let file_path = PathBuf::from(&motifs_file);
                 motif_reg.insert_from_file(&file_path)
                     .map_err(|e| PyValueError::new_err(e.to_string()))?;
             } else {
+                // It's not a file; treat 'motifs_file' as raw content or a string identifier
                 motif_reg.insert_from_reader(Cursor::new(motifs_file), "manual").unwrap();
             }
 
@@ -387,10 +516,23 @@ impl Simulator {
                 .map_err(|e| PyValueError::new_err(e.to_string()))?;
 
             let seq_clone = (*sequence_arc).clone();
+            let master_timeline_times: Vec<f64> = times
+                .iter()
+                .scan(0.0, |acc, &dt| {
+                    *acc += dt;
+                    Some(*acc)
+                })
+                .collect();
+
             let motif_reg = Arc::new(motif_reg);
 
+            let init_struc = match start {
+                Some(s) => DotBracketVec::try_from(s).unwrap(),
+                None => DotBracketVec::try_from(".").unwrap(),
+            };
+
             let check_results: Vec<_> = match (self.rate_model.k3ws().is_some(), self.rate_model.k4ws().is_some()) {
-                (false, false) => build_parallel_runs_motif_check(
+                (false, false) => build_par_iterator_motif_check(
                     seq_clone,
                     &start_pt,
                     Arc::clone(&self.energy_model),
@@ -402,7 +544,7 @@ impl Simulator {
                     SSAKind::NoShift,
                     t_pos
                 ).unwrap(),
-                (true, false) => build_parallel_runs_motif_check(
+                (true, false) => build_par_iterator_motif_check(
                     seq_clone,
                     &start_pt,
                     Arc::clone(&self.energy_model),
@@ -414,7 +556,7 @@ impl Simulator {
                     SSAKind::ThreeWayOnly,
                     t_pos
                 ).unwrap(),
-                (false, true) => build_parallel_runs_motif_check(
+                (false, true) => build_par_iterator_motif_check(
                     seq_clone,
                     &start_pt,
                     Arc::clone(&self.energy_model),
@@ -426,7 +568,7 @@ impl Simulator {
                     SSAKind::FourWayOnly,
                     t_pos
                 ).unwrap(),
-                (true, true) => build_parallel_runs_motif_check(
+                (true, true) => build_par_iterator_motif_check(
                     seq_clone,
                     &start_pt,
                     Arc::clone(&self.energy_model),
@@ -440,27 +582,31 @@ impl Simulator {
                 ).unwrap(),
             };
 
-            let master_check_results = merge_check_results(&check_results);
-            convert_check_results_python_friendly(py, master_check_results).map(|list| list.to_object(py))
+            let mut master_check_results = merge_check_results(&check_results);
+            return convert_check_results_python_friendly(py, master_check_results).map(|list| list.to_object(py))
         })
     }
 }
 
-
-fn convert_timeline_python_friendly<'py>(
-    py: Python<'py>,
+fn convert_timeline_python_friendly(
+    py: Python,
     timeline: Timeline<ViennaRNA>
-) -> PyResult<Bound<'py, PyList>> {
-    let py_list = PyList::empty_bound(py);
+) -> PyResult<&PyList> {
+    let py_list = PyList::empty(py);
 
     for tp in timeline.points {
-        let dict = PyDict::new_bound(py);
+        let dict = PyDict::new(py);
         dict.set_item("time", tp.time)?;
+        dict.set_item("counter", tp.counter)?;
 
-        let ensemble = PyDict::new_bound(py);
+        let ensemble = PyDict::new(py);
 
         for (k, v) in tp.ensemble.iter() {
             ensemble.set_item(k, v)?;
+        }
+
+        if !tp.ensemble.contains_key(&0) {
+            ensemble.set_item(0, 0)?;
         }
 
         dict.set_item("ensemble", ensemble)?;
@@ -470,12 +616,11 @@ fn convert_timeline_python_friendly<'py>(
     Ok(py_list)
 }
 
-
-fn convert_check_results_python_friendly<'py>(
-    py: Python<'py>,
+fn convert_check_results_python_friendly(
+    py: Python,
     results: CheckResults,
-) -> PyResult<Bound<'py, PyList>> {
-    let py_list = PyList::empty_bound(py);
+) -> PyResult<&PyList> {
+    let py_list = PyList::empty(py);
 
     for (i, (&count, distances)) in results
         .num_success_sims_per_ts
@@ -483,11 +628,17 @@ fn convert_check_results_python_friendly<'py>(
         .zip(results.distances_per_ts.iter())
         .enumerate()
     {
-        let dict = PyDict::new_bound(py);
+        let dict = PyDict::new(py);
 
-        dict.set_item("ts", i + 1)?;
+        dict.set_item("ts", i+1)?;
         dict.set_item("num_success", count)?;
-        dict.set_item("distances", distances)?;
+
+        let dist_list = PyList::empty(py);
+        for d in distances {
+            dist_list.append(d)?;
+        }
+
+        dict.set_item("distances", dist_list)?;
 
         py_list.append(dict)?;
     }
@@ -526,7 +677,42 @@ where
     })
 }
 
-fn build_parallel_runs_motif_timecourse<P>(
+
+fn build_iterator_motif_match<P>(
+    seq: NucleotideVec,
+    start_pt: &PairTable,
+    energy_model: Arc<ViennaRNA>,
+    rate_model: Arrhenius,
+    times: Vec<f64>,
+    motif_registry: MotifRegistry<ViennaRNA>,
+    policy: P,
+    wrap: fn(SSA<LoopNeighbors<ViennaRNA, P>, Arrhenius>) -> SSAKind,
+) -> PyResult<SimulationIteratorMotifMatch>
+where
+    P: shift_policy::ShiftPolicy,
+{
+    let walker = LoopNeighbors::try_from((
+        seq,
+        start_pt,
+        energy_model,
+        policy,
+    ))
+    .map_err(|e| PyValueError::new_err(e.to_string()))?;
+
+    let ssa = wrap(SSA::from((walker, rate_model)));
+
+
+    Ok(SimulationIteratorMotifMatch {
+        ssa,
+        rng: SmallRng::from_os_rng(),
+        times,
+        elapsed: 0.0,
+        finished: false,
+        motif_registry: motif_registry,
+    })
+}
+
+fn build_par_iterator_motif_match<P>(
     seq: NucleotideVec,
     start_pt: &PairTable,
     energy_model: Arc<ViennaRNA>,
@@ -539,7 +725,7 @@ fn build_parallel_runs_motif_timecourse<P>(
     ) -> PyResult<Vec<Timeline<ViennaRNA>>>
     where
     P: shift_policy::ShiftPolicy + Send + Sync + Clone + 'static,
-{
+    {
     use rayon::prelude::*;
     use rayon::ThreadPoolBuilder;
 
@@ -563,15 +749,14 @@ fn build_parallel_runs_motif_timecourse<P>(
                     let times = times.clone();
                     let motif_registry = motif_registry.clone();
                     let rate_model = rate_model.clone();
-                    let master_times = master_timeline_times.clone();
-                    move || (times.clone(), motif_registry.clone(), rate_model.clone(), master_times.clone())
+                    move || (times.clone(), motif_registry.clone(), rate_model.clone())
                 },
                 {
                     let seq = seq.clone();
                     let energy_model = energy_model.clone();
                     let policy = policy.clone();
 
-                    move |(times, motif_registry, rate_model, master_times), _| {
+                    move |(times, motif_registry, rate_model), _| {
                         let walker = LoopNeighbors::try_from((
                             seq.clone(),
                             start_pt,
@@ -580,21 +765,22 @@ fn build_parallel_runs_motif_timecourse<P>(
                         ))
                         .expect("Failed to build walker");
 
-                        let mut sim_res = SimulationEnsembleMotifTimecourse {
+                        let mut sim_res = SimulationEnsembleIteratorMotifMatch {
                             ssa: wrap(SSA::from((walker, rate_model.clone()))),
                             rng: SmallRng::from_os_rng(),
                             times: times.clone(),
-                            times_idx: 0, // Optimizes O(N) array shifting
                             elapsed: 0.0,
                             finished: false,
+                            motif_registry: motif_registry.clone(),
                             timeline: Timeline::new(
-                                master_times.clone(),
+                                master_timeline_times.clone(),
                                 motif_registry.clone(),
                             ),
                             t_idx: 0,
                         };
 
                         sim_res.run();
+
                         sim_res.get_timeline()
                     }
                 },
@@ -605,7 +791,7 @@ fn build_parallel_runs_motif_timecourse<P>(
     Ok(results)
 }
 
-fn build_parallel_runs_motif_check<P>(
+fn build_par_iterator_motif_check<P>(
     seq: NucleotideVec,
     start_pt: &PairTable,
     energy_model: Arc<ViennaRNA>,
@@ -619,15 +805,21 @@ fn build_parallel_runs_motif_check<P>(
     ) -> PyResult<Vec<CheckResults>>
     where
     P: shift_policy::ShiftPolicy + Send + Sync + Clone + 'static,
-{
+    {
     use rayon::prelude::*;
     use rayon::ThreadPoolBuilder;
+
+    let master_timeline_times: Vec<f64> = times
+        .iter()
+        .scan(0.0, |acc, &dt| {
+            *acc += dt;
+            Some(*acc)
+        })
+        .collect();
 
     let pool = ThreadPoolBuilder::new()
         .build()
         .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let shared_t_pos = Arc::new(t_pos);
 
     let results = pool.install(|| {
         (0..num_sims)
@@ -637,15 +829,15 @@ fn build_parallel_runs_motif_check<P>(
                     let times = times.clone();
                     let motif_registry = motif_registry.clone();
                     let rate_model = rate_model.clone();
-                    let shared_t_pos = shared_t_pos.clone();
-                    move || (times.clone(), motif_registry.clone(), rate_model.clone(), shared_t_pos.clone())
+                    let t_pos = t_pos.clone();
+                    move || (times.clone(), motif_registry.clone(), rate_model.clone(), t_pos.clone())
                 },
                 {
                     let seq = seq.clone();
                     let energy_model = energy_model.clone();
                     let policy = policy.clone();
 
-                    move |(times, motif_registry, rate_model, shared_t_pos), _| {
+                    move |(times, motif_registry, rate_model, t_pos), _| {
                         let walker = LoopNeighbors::try_from((
                             seq.clone(),
                             start_pt,
@@ -654,18 +846,16 @@ fn build_parallel_runs_motif_check<P>(
                         ))
                         .expect("Failed to build walker");
 
-                        let mut sim_res = SimulationEnsembleMotifCheck {
+                        let mut sim_res = SimulationEnsembleIteratorMotifCheck {
                             ssa: wrap(SSA::from((walker, rate_model.clone()))),
                             rng: SmallRng::from_os_rng(),
                             times: times.clone(),
-                            times_idx: 0,
                             elapsed: 0.0,
                             finished: false,
                             motif_registry: motif_registry.clone(),
-                            check_results: CheckResults { num_success_sims_per_ts: vec![0; motif_registry.len()-1], distances_per_ts: vec![Vec::new(); motif_registry.len()-1] },
+                            check_results: CheckResults { num_success_sims_per_ts: Vec::new(), distances_per_ts: Vec::new() },
                             t_idx: 0,
-                            t_pos: Arc::clone(shared_t_pos),
-                            t_pos_idx: 0,
+                            t_pos: t_pos.clone(),
                             cur_in_t: false,
                             ts_counter: 0,
                             distances: Vec::new(),
@@ -673,6 +863,7 @@ fn build_parallel_runs_motif_check<P>(
                         };
 
                         sim_res.run();
+
                         sim_res.get_check_results()
                     }
                 },
@@ -693,6 +884,7 @@ pub fn merge_check_results(results: &[CheckResults]) -> CheckResults {
 
     let len = results[0].num_success_sims_per_ts.len();
 
+    // Optional safety: ensure all have same shape
     for r in results {
         assert_eq!(r.num_success_sims_per_ts.len(), len);
         assert_eq!(r.distances_per_ts.len(), len);
@@ -705,21 +897,8 @@ pub fn merge_check_results(results: &[CheckResults]) -> CheckResults {
         for i in 0..len {
             merged_counts[i] += r.num_success_sims_per_ts[i];
 
-            // Get the incoming vector for this timestep
-            let incoming_vec = &r.distances_per_ts[i];
-            
-            // Get the destination vector in merged_distances
-            let destination_vec = &mut merged_distances[i];
-
-            for (j, &value) in incoming_vec.iter().enumerate() {
-                if j < destination_vec.len() {
-                    // If the index exists, add the value
-                    destination_vec[j] += value;
-                } else {
-                    // If the incoming vector is longer, push the new value
-                    destination_vec.push(value);
-                }
-            }
+            // flatten (append inner vectors)
+            merged_distances[i].extend(&r.distances_per_ts[i]);
         }
     }
 
@@ -817,18 +996,108 @@ impl SimulationIterator {
     }
 }
 
-pub struct SimulationEnsembleMotifTimecourse {
+#[pyclass]
+pub struct SimulationIteratorMotifMatch {
     ssa: SSAKind,
     rng: SmallRng,
     times: Vec<f64>,
-    times_idx: usize, // Pointer replacement for .remove(0)
     elapsed: f64,
     finished: bool,
+    motif_registry: MotifRegistry<ViennaRNA>
+}
+
+#[pymethods]
+impl SimulationIteratorMotifMatch {
+
+    fn __iter__(slf: PyRef<Self>) -> PyRef<Self> {
+        slf
+    }
+
+    fn __next__(
+        mut slf: PyRefMut<Self>
+    ) -> Option<(String, i32, f64, f64, f64)> {
+
+        let this: &mut Self = &mut slf;
+
+        if this.finished {
+            return None;
+        }
+
+        let mut produced: Option<(String, i32, f64, f64, f64)> = None;
+
+        let rng = &mut this.rng;
+        let mut mytinc = 0.0;
+        let mut first_pass = true;
+
+        macro_rules! dispatch_ssa {
+            ($ssa:expr) => {{
+                $ssa.co_simulate(
+                    rng,
+                    &this.times,
+                    |t, tinc, flux, w| {
+                        if first_pass {
+                            mytinc = tinc.min(this.times[0]);
+
+                            produced = Some((
+                                    w.to_string(),
+                                    w.current_energy(),
+                                    this.elapsed + t,
+                                    mytinc,
+                                    flux,
+                            ));
+
+                            this.elapsed += mytinc;
+                            first_pass = false;
+                            // advance the simulator to update the structure.
+                            true
+                        } else {
+                            false
+                        }
+                    },
+                    );
+            }};
+        }
+
+        match &mut this.ssa {
+            SSAKind::NoShift(ssa) => dispatch_ssa!(ssa),
+            SSAKind::ThreeWayOnly(ssa) => dispatch_ssa!(ssa),
+            SSAKind::FourWayOnly(ssa) => dispatch_ssa!(ssa),
+            SSAKind::ThreeAndFour(ssa) => dispatch_ssa!(ssa),
+        }
+        
+        if (this.times[0] - mytinc).abs() < f64::EPSILON {
+            let structure = produced.as_ref()
+                .and_then(|(s, ..)| DotBracketVec::try_from(s.as_str()).ok())?;
+            
+            let motif_found = !this.motif_registry.classify(&structure).iter().all(|&x| x == 0);
+
+            this.times.remove(0);
+            
+            if this.times.is_empty() || motif_found {
+                this.finished = true;
+            }
+        } else {
+            assert!(this.times[0] > mytinc);
+            this.times[0] -= mytinc;
+        }
+        produced
+    }
+}
+
+
+pub struct SimulationEnsembleIteratorMotifMatch {
+    ssa: SSAKind,
+    rng: SmallRng,
+    times: Vec<f64>,
+    elapsed: f64,
+    finished: bool,
+    motif_registry: Arc<MotifRegistry<ViennaRNA>>,
     timeline: Timeline<ViennaRNA>,
     t_idx: usize
 }
 
-impl SimulationEnsembleMotifTimecourse {
+
+impl SimulationEnsembleIteratorMotifMatch {
     pub fn run(&mut self) {
         while !self.finished {
             self.step();
@@ -841,7 +1110,7 @@ impl SimulationEnsembleMotifTimecourse {
     }
 }
 
-impl SimulationEnsembleMotifTimecourse {
+impl SimulationEnsembleIteratorMotifMatch {
     /// Internal helper that performs a single simulation step
     fn step(&mut self) {
         if self.finished {
@@ -852,31 +1121,24 @@ impl SimulationEnsembleMotifTimecourse {
         let rng = &mut self.rng;
         let mut mytinc = 0.0;
         let mut first_pass = true;
-        let current_time = self.times[self.times_idx];
 
         {
             macro_rules! dispatch_ssa {
                 ($ssa:expr) => {{
                     $ssa.co_simulate(
                         rng,
-                        &self.times[self.times_idx..], // Process slice directly
+                        &self.times,
                         |t, tinc, flux, w| {
                             if first_pass {
-                                mytinc = tinc.min(current_time);
+                                mytinc = tinc.min(self.times[0]);
 
-                                // Check bound before processing string creation
-                                let is_at_target_time = (current_time - mytinc).abs() < f64::EPSILON;
-
-                                if is_at_target_time {
-                                    // String creation deferred exclusively to matched time thresholds
-                                    produced = Some((
-                                        w.to_string(),
-                                        w.current_energy(),
-                                        self.elapsed + t,
-                                        mytinc,
-                                        flux,
-                                    ));
-                                }
+                                produced = Some((
+                                    w.to_string(),
+                                    w.current_energy(),
+                                    self.elapsed + t,
+                                    mytinc,
+                                    flux,
+                                ));
 
                                 self.elapsed += mytinc;
                                 first_pass = false;
@@ -897,63 +1159,68 @@ impl SimulationEnsembleMotifTimecourse {
             }
         }
 
-        if (self.times[self.times_idx] - mytinc).abs() < f64::EPSILON {
+        // let mut motif_found = false;
+
+        if (self.times[0] - mytinc).abs() < f64::EPSILON {
 
             // Extract the structure string if it exists
             if let Some((ref s, ..)) = produced {
                 if let Ok(structure) = DotBracketVec::try_from(s.as_str()) {
                     self.timeline.assign_structure(self.t_idx, &structure);
                     self.t_idx += 1;
+                    // Check motif length and classify
+                    // if self.motif_registry.min_motif_length() <= &structure.len() {
+                    //    let classifications = self.motif_registry.classify(&structure);
+                    //    motif_found = !classifications.iter().all(|&x| x == 0);
+                    //}
                 }
             }
 
-            // O(1) Progression instead of O(N) array shifting
-            self.times_idx += 1;
+            self.times.remove(0);
             
-            if self.times_idx >= self.times.len() {
+            if self.times.is_empty() {
                 self.finished = true;
             }
         } else {
             // Guard against underflow
-            assert!(self.times[self.times_idx] > mytinc);
-            self.times[self.times_idx] -= mytinc;
+            assert!(self.times[0] > mytinc);
+            self.times[0] -= mytinc;
         }
     }
 }
 
-
-
-pub struct SimulationEnsembleMotifCheck {
+pub struct SimulationEnsembleIteratorMotifCheck {
     ssa: SSAKind,
     rng: SmallRng,
     times: Vec<f64>,
-    times_idx: usize,
     elapsed: f64,
     finished: bool,
     motif_registry: Arc<MotifRegistry<ViennaRNA>>,
     check_results: CheckResults,
     t_idx: usize,
-    t_pos: Arc<Vec<usize>>,
-    t_pos_idx: usize,
+    t_pos: Vec<usize>,
     cur_in_t: bool,
     ts_counter: usize,
     distances: Vec<usize>,
     wrong_path: bool
 }
 
-impl SimulationEnsembleMotifCheck {
+
+impl SimulationEnsembleIteratorMotifCheck {
     pub fn run(&mut self) {
         while !self.finished {
             self.step();
         }
     }
 
+    /// Returns the timeline after the simulation is done
     pub fn get_check_results(self) -> CheckResults {
         self.check_results
     }
 }
 
-impl SimulationEnsembleMotifCheck {
+impl SimulationEnsembleIteratorMotifCheck {
+    /// Internal helper that performs a single simulation step
     fn step(&mut self) {
         if self.finished {
             return;
@@ -963,30 +1230,24 @@ impl SimulationEnsembleMotifCheck {
         let rng = &mut self.rng;
         let mut mytinc = 0.0;
         let mut first_pass = true;
-        let current_time = self.times[self.times_idx];
 
         {
             macro_rules! dispatch_ssa {
                 ($ssa:expr) => {{
                     $ssa.co_simulate(
                         rng,
-                        &self.times[self.times_idx..],
+                        &self.times,
                         |t, tinc, flux, w| {
                             if first_pass {
-                                mytinc = tinc.min(current_time);
+                                mytinc = tinc.min(self.times[0]);
 
-                                let is_at_target_time = (current_time - mytinc).abs() < f64::EPSILON;
-                                let is_at_target_pos = self.t_pos_idx < self.t_pos.len() && self.t_idx == self.t_pos[self.t_pos_idx];
-                                
-                                if is_at_target_time && is_at_target_pos {
-                                    produced = Some((
-                                        w.to_string(),
-                                        w.current_energy(),
-                                        self.elapsed + t,
-                                        mytinc,
-                                        flux,
-                                    ));
-                                }
+                                produced = Some((
+                                    w.to_string(),
+                                    w.current_energy(),
+                                    self.elapsed + t,
+                                    mytinc,
+                                    flux,
+                                ));
 
                                 self.elapsed += mytinc;
                                 first_pass = false;
@@ -1007,9 +1268,12 @@ impl SimulationEnsembleMotifCheck {
             }
         }
 
-        if (self.times[self.times_idx] - mytinc).abs() < f64::EPSILON {
-            if self.t_pos_idx < self.t_pos.len() && self.t_idx == self.t_pos[self.t_pos_idx] {
+        if (self.times[0] - mytinc).abs() < f64::EPSILON {
+            // println!("INSIDE");
+            if self.t_idx == self.t_pos[0] {
+                // println!("IN T DOMAIN");
                 if !self.cur_in_t{
+                    // println!("ENTERING T");
                     self.ts_counter += 1;
                     self.cur_in_t = true;
                     self.wrong_path = true;
@@ -1022,51 +1286,60 @@ impl SimulationEnsembleMotifCheck {
 
                         if self.wrong_path {
                             let classifications = self.motif_registry.classify(&structure);
+                            //println!("classifications: {}", classifications);
                             self.wrong_path = !classifications.contains(&self.ts_counter);
+                            // println!("wrong path: {}", self.wrong_path);
                         }
                     }
                 }
-                self.t_pos_idx += 1;
+                self.t_pos.remove(0);
             }
             else {
+                // self.timeline.remove_point(self.t_idx);
+
                 if self.cur_in_t {
+                    // println!("MOVING OUTSIDE OF T-DOMAIN");
                     self.cur_in_t = false;
 
                     let old_distances = std::mem::take(&mut self.distances);
-                    self.check_results.distances_per_ts[self.ts_counter-1] = old_distances;
+                    self.check_results.distances_per_ts.push(old_distances);
 
                     if !self.wrong_path {
-                        self.check_results.num_success_sims_per_ts[self.ts_counter-1] = 1;
+                        self.check_results.num_success_sims_per_ts.push(1);
+                        println!("SUCCESS");
                     }
                     else {
+                        self.check_results.num_success_sims_per_ts.push(0);
+                        println!("FAIL");
                         self.finished = true;
                     }
                 }
             }
 
-            // O(1) Progression
-            self.times_idx += 1;
+            self.times.remove(0);
             self.t_idx += 1;
             
-            // Check end via index bounds
-            if self.times_idx >= self.times.len() {
+            if self.times.is_empty() {
                 self.finished = true;
 
                 let old_distances = std::mem::take(&mut self.distances);
-                self.check_results.distances_per_ts[self.ts_counter-1] = old_distances;
+                self.check_results.distances_per_ts.push(old_distances);
 
                 if !self.wrong_path {
-                    self.check_results.num_success_sims_per_ts[self.ts_counter-1] = 1;
+                    self.check_results.num_success_sims_per_ts.push(1);
+                    println!("SUCCESS");
                     }
                 else {
+                    self.check_results.num_success_sims_per_ts.push(0);
+                    println!("FAIL");
                     self.finished = true;
                 }
             }
 
         } else {
             // Guard against underflow
-            assert!(self.times[self.times_idx] > mytinc);
-            self.times[self.times_idx] -= mytinc;
+            assert!(self.times[0] > mytinc);
+            self.times[0] -= mytinc;
         }
     }
 }

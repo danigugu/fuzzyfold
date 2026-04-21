@@ -123,6 +123,11 @@ impl<'a, E: EnergyModel> Timeline<E> {
         self.points[t_idx].add(m_idx);
     }
 
+    pub fn remove_point(&mut self, t_idx: usize) {
+        self.points.remove(t_idx);
+    }
+
+
     /// Get a reference to a timepoint by index.
     pub fn point(&self, t_idx: usize) -> &Timepoint {
         &self.points[t_idx]
@@ -163,8 +168,8 @@ impl<'a, E: EnergyModel> fmt::Display for Timeline<E> {
 
             // Sort by energy, None last
             entries.sort_by(|(a_idx, _), (b_idx, _)| {
-                let e_a = self.registry.macrostates()[*a_idx].energy();
-                let e_b = self.registry.macrostates()[*b_idx].energy(); 
+                let e_a = self.registry.motifs()[*a_idx].energy();
+                let e_b = self.registry.motifs()[*b_idx].energy(); 
                 e_a.partial_cmp(&e_b).unwrap_or(std::cmp::Ordering::Equal)
             });
 
@@ -172,8 +177,8 @@ impl<'a, E: EnergyModel> fmt::Display for Timeline<E> {
             for (m_idx, count) in entries {
                 let occu = count as f64 / total as f64;
 
-                let name = self.registry.macrostates()[m_idx].name();
-                let energy = self.registry.macrostates()[m_idx].energy().unwrap_or(0.0);
+                let name = self.registry.motifs()[m_idx].name();
+                let energy = self.registry.motifs()[m_idx].energy().unwrap_or(0.0);
 
                 writeln!(
                     f,

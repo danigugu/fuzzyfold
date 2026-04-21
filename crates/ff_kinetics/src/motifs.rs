@@ -4,6 +4,7 @@ use std::io::BufReader;
 use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::cmp::min;
 
 use ff_structure::DotBracketVec;
 use ff_structure::PairTable;
@@ -130,16 +131,46 @@ impl Motif {
         true
     }
 
+    pub fn distance(&self, structure: &PairTable) -> usize {
+        let mut dist_counter = 0;
+
+        for (key, value) in &self.constr_pos_map.0 {
+            if *key as usize >= structure.len() {
+                return 0;
+            }
+
+            let entry: Option<NAIDX> = structure.get(key);
+
+            match value {
+                // Pair is mismatched -> add distance of 2
+                ConstrPos::Pair(expected) => {
+                    if entry != Some(*expected) {
+                        dist_counter += 2;
+                    }
+                }
+                // Unpaired Position is paired -> add distance of 1
+                ConstrPos::X => {
+                    if entry.is_some() {
+                        dist_counter += 1;
+                    }
+                }
+            }
+
+        }
+        return dist_counter;
+    }
+
 }
 
 
 
-/// A registy to collect macrostate definitions.
+/// A registry to collect macrostate definitions.
 pub struct MotifRegistry<E: EnergyModel> {
     sequence: Arc<NucleotideVec>,
     energy_model: Arc<E>,
     /// By convention: motifs[0] = unassigned.
     motifs: Vec<Motif>,
+    min_motif_length: usize
 }
 
 impl<E: EnergyModel> From<(Arc<NucleotideVec>, Arc<E>)> for MotifRegistry<E> {
@@ -150,6 +181,7 @@ impl<E: EnergyModel> From<(Arc<NucleotideVec>, Arc<E>)> for MotifRegistry<E> {
             sequence,
             energy_model,
             motifs,
+            min_motif_length: usize::MAX,
         }
     }
 }
@@ -244,6 +276,7 @@ impl<E: EnergyModel> MotifRegistry<E> {
             );
 
             motifs.push(motif);
+            self.min_motif_length = min(structure_str.len(), self.min_motif_length);
         }
     
 
@@ -280,11 +313,15 @@ impl<E: EnergyModel> MotifRegistry<E> {
         self.sequence.as_ref()
     }
 
+    pub fn min_motif_length(&self) -> &usize {
+        &self.min_motif_length
+    }
+
     pub fn energy_model(&self) -> &E {
         self.energy_model.as_ref()
     }
 
-    pub fn macrostates(&self) -> &Vec<Motif> {
+    pub fn motifs(&self) -> &Vec<Motif> {
         &self.motifs
     }
 
@@ -439,7 +476,7 @@ mod tests {
         let mut registry = MotifRegistry::from((Arc::clone(&seq), Arc::clone(&energy_model)));
 
         assert_eq!(registry.len(), 1);
-        assert_eq!(registry.macrostates()[0].name(), "Unassigned");
+        assert_eq!(registry.motifs()[0].name(), "Unassigned");
 
         let input = 
      r#"UCAGUCUUCGCUGCGCUGUAUCGAUUCGGUUUCAGUUUUUAUUGC
