@@ -197,10 +197,10 @@ same Rust crate, but with **different feature flags**:
 | Consumer | Feature flag | Output |
 |----------|-------------|--------|
 | Python (maturin) | `--features python` | `target/release/libmotifs.so` + installs into the active virtualenv |
-| C / C++ (cargo) | `--no-default-features` | `target_ffi/release/libmotifs.so` |
+| C / C++ (cargo) | `--no-default-features` | `target_motifs_ffi/release/libmotifs.so` |
 
 The two builds use **separate Cargo target directories** (`target/` and
-`target_ffi/`) so they never overwrite each other.  If they shared the same
+`target_motifs_ffi/`) so they never overwrite each other.  If they shared the same
 directory, a maturin build would leave `libmotifs.so` linked against CPython,
 and the C++ binary would immediately crash with an `undefined symbol:
 PyExc_TypeError` error on the next invocation.
@@ -212,9 +212,9 @@ PyExc_TypeError` error on the next invocation.
 conda activate fuzzyfold
 maturin develop --manifest-path crates/ff_motifs/Cargo.toml --features python --release
 
-# C++ shared library + header + binary — uses target_ffi/ to stay isolated
+# C++ shared library + header + binary — uses target_motifs_ffi/ to stay isolated
 cd /path/to/SamplingDesign
-make main          # runs: CARGO_TARGET_DIR=…/target_ffi cargo build --release --no-default-features
+make main          # runs: CARGO_TARGET_DIR=…/target_motifs_ffi cargo build --release --no-default-features
                    #        cbindgen → ff_motifs_ffi.h
                    #        g++ → bin/main
 ```
