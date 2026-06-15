@@ -163,7 +163,7 @@ impl MotifCheckSimulator {
     // simulate_timecourse
     // -----------------------------------------------------------------------
 
-    #[pyo3(signature = (sequence, motifs, check_positions, start=None, t_ext=None, t_end=1.0, num_sims=100, num_workers=0))]
+    #[pyo3(signature = (sequence, motifs, check_positions, start=None, t_ext=0.02, t_end=0.02, num_sims=100, num_workers=0))]
     fn simulate_timecourse(
         &self,
         py:              Python<'_>,
@@ -190,7 +190,7 @@ impl MotifCheckSimulator {
     // simulate_timecourse_checkpoints
     // -----------------------------------------------------------------------
 
-    #[pyo3(signature = (sequence, motifs, check_positions, checkpoints, start=None, t_ext=None, t_end=1.0, num_sims=100, num_workers=0))]
+    #[pyo3(signature = (sequence, motifs, check_positions, checkpoints, start=None, t_ext=0.02, t_end=0.02, num_sims=100, num_workers=0))]
     fn simulate_timecourse_checkpoints(
         &self,
         py:              Python<'_>,

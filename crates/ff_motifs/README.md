@@ -65,8 +65,8 @@ The special motif name **`Unassigned`** is automatically added to every registry
 | `k0` | `1e5` | Attempt frequency (s⁻¹); sets the overall timescale of structural transitions |
 | `k3ws` | `0.0` | Three-way shift rate constant; `0.0` disables three-way shifts |
 | `k4ws` | `0.0` | Four-way shift rate constant; `0.0` disables four-way shifts |
-| `t_ext` | — | Time window per transcription step (s); how long the molecule folds before the next nucleotide is added |
-| `t_end` | `1.0` | Time to simulate at full sequence length (s) |
+| `t_ext` | `0.02` | Time window per transcription step (s); how long the molecule folds before the next nucleotide is added |
+| `t_end` | `0.02` | Time to simulate at full sequence length (s) |
 | `num_sims` | — | Number of independent SSA trajectories to run in parallel |
 | `threshold` | — | Minimum fraction of simulations that must be in the expected motif at a checkpoint to continue; simulations failing this are cut short (see [Checkpoint logic](#checkpoint-logic)) |
 | `num_workers` | `0` | Thread count for Rayon: `0` = all available cores, `1` = serial (safe when called from OpenMP), `N` = exactly N threads |
@@ -222,7 +222,7 @@ results = sim.simulate_timecourse(
     motifs=motif_str,
     check_positions={8: ["hairpin"]},
     t_ext=0.02,
-    t_end=1.0,
+    t_end=0.02,
     num_sims=200,
     num_workers=0,
 )
@@ -245,7 +245,7 @@ results = sim.simulate_timecourse_checkpoints(
     check_positions={8: ["hairpin"]},
     checkpoints={8: {"hairpin": 0.5}},   # require ≥50% occupancy to continue
     t_ext=0.02,
-    t_end=1.0,
+    t_end=0.02,
     num_sims=200,
 )
 ```
@@ -270,7 +270,7 @@ config = PyCotransConfig(
         "T0": 3, "T1": 3, "T2": 5, "T3": 5,
     },
     t_ext=0.02,
-    t_end=1.0,
+    t_end=0.02,
     num_sims=100,
     threshold=0.6,
     num_workers=4,
@@ -339,7 +339,7 @@ let config = CotransConfig::from_target(
     "s1 L1 T1",     // dl_seq
     dom_length_dict,
     0.02,           // t_ext
-    1.0,            // t_end
+    0.02,           // t_end
     100,            // num_sims
     0.6,            // threshold
     0,              // num_workers (all cores)
@@ -368,7 +368,7 @@ ConfigHandle *cfg = config_create(
     "s1 L1 T1",     // dl_seq
     keys, vals, 3,  // domain length dict (parallel arrays)
     0.02,           // t_ext
-    1.0,            // t_end
+    0.02,           // t_end
     100,            // num_sims
     0.6,            // threshold
     1               // num_workers = 1 (serial, safe inside OpenMP)
