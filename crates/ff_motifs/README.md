@@ -189,6 +189,41 @@ score = (pathlength - Σ avg_occupancy_per_T_domain) / pathlength
 
 ---
 
+## Build isolation (Python vs C/C++)
+
+Both the Python extension and the C/C++ shared library are compiled from the
+same Rust crate, but with **different feature flags**:
+
+| Consumer | Feature flag | Output |
+|----------|-------------|--------|
+| Python (maturin) | `--features python` | `target/release/libmotifs.so` + installs into the active virtualenv |
+| C / C++ (cargo) | `--no-default-features` | `target_ffi/release/libmotifs.so` |
+
+The two builds use **separate Cargo target directories** (`target/` and
+`target_ffi/`) so they never overwrite each other.  If they shared the same
+directory, a maturin build would leave `libmotifs.so` linked against CPython,
+and the C++ binary would immediately crash with an `undefined symbol:
+PyExc_TypeError` error on the next invocation.
+
+**Build order** (both can be done independently, in either order):
+
+```bash
+# Python extension — installs into the active conda / virtualenv
+conda activate fuzzyfold
+maturin develop --manifest-path crates/ff_motifs/Cargo.toml --features python --release
+
+# C++ shared library + header + binary — uses target_ffi/ to stay isolated
+cd /path/to/SamplingDesign
+make main          # runs: CARGO_TARGET_DIR=…/target_ffi cargo build --release --no-default-features
+                   #        cbindgen → ff_motifs_ffi.h
+                   #        g++ → bin/main
+```
+
+The `make main` target in `SamplingDesign/Makefile` already sets
+`CARGO_TARGET_DIR` correctly; you never need to set it manually.
+
+---
+
 ## Usage
 
 ### Python
@@ -196,8 +231,8 @@ score = (pathlength - Σ avg_occupancy_per_T_domain) / pathlength
 Build with the `python` feature (requires [maturin](https://github.com/PyO3/maturin)):
 
 ```bash
-cd crates/ff_motifs
-maturin develop --features python
+conda activate <your-env>
+maturin develop --manifest-path crates/ff_motifs/Cargo.toml --features python --release
 ```
 
 #### Quick start — `simulate_timecourse`
