@@ -77,10 +77,54 @@ impl<W: Walker, K: RateModel> SSA<W, K> {
                 break;
             }
 
-            let (old, new) = self.walker.apply_extension(); 
+            let (old, new) = self.walker.apply_extension();
             self.update_rate_tree(old, new);
 
             gtime += time;
+        }
+    }
+
+    pub fn co_simulate_checked<R, F>(
+        &mut self,
+        rng: &mut R,
+        times: &[f64],
+        mut on_window_end: F,
+    ) where
+        R: Rng + ?Sized,
+        F: FnMut(&W, usize),
+    {
+        for (idx, &window) in times.iter().enumerate() {
+            let mut window_remaining = window;
+
+            loop {
+                let rsum = self.rate_tree.total_rate();
+
+                if rsum == 0.0 {
+                    break;
+                }
+
+                let tinc = -rng.random::<f64>().ln() / rsum;
+
+                if tinc >= window_remaining {
+                    break;
+                }
+
+                window_remaining -= tinc;
+
+                let threshold = rng.random::<f64>() * rsum;
+                let mv = self.rate_tree
+                    .select_by_threshold(threshold)
+                    .expect("Must select a move!");
+                let (old, new) = self.walker.apply_move(&mv);
+                self.update_rate_tree(old, new);
+            }
+
+            on_window_end(&self.walker, idx + 1);
+
+            if idx + 1 < times.len() {
+                let (old, new) = self.walker.apply_extension();
+                self.update_rate_tree(old, new);
+            }
         }
     }
 
@@ -193,7 +237,7 @@ mod tests {
     use crate::Arrhenius;
     use crate::movesets::LoopNeighbors;
     use crate::movesets::shift_policy;
-    use crate::movesets::loop_table::LoopTable;
+    use crate::movesets::loop_table_arc::LoopTable;
     use crate::movesets::Move;
 
     macro_rules! setup_ssa_input {
@@ -203,10 +247,13 @@ mod tests {
 
             let sequence = NucleotideVec::try_from($seq)
                 .expect("Invalid sequence?");
+            let sequence = Arc::new(sequence);
+
             let pairings = PairTable::try_from($db)
                 .expect("Invalid structure?");
+            let pairings = Arc::new(pairings);
 
-            let ltab = LoopTable::try_from((sequence, &pairings, Arc::new(emodel)))
+            let ltab = LoopTable::try_from((sequence, pairings, Arc::new(emodel)))
                 .expect("Invalid sequence/structure combination");
             let $wname = LoopNeighbors::from((ltab, shift_policy::NoShift));
         };
@@ -225,9 +272,11 @@ mod tests {
         let policy = shift_policy::ThreeAndFour;
 
         let sequence = NucleotideVec::try_from("UCAGUCUUCGCUGCGCUGUAUCGAUUCGGUUUCAGUUUUUAUUGC").expect("Invalid sequence?");
+        let sequence = Arc::new(sequence);
         let pairings =     PairTable::try_from(".((((....)))).((((........))))...............").expect("Invalid structure?");
+        let pairings = Arc::new(pairings);
 
-        let ltab = LoopTable::try_from((sequence.clone(), &pairings, emodel.clone()))
+        let ltab = LoopTable::try_from((Arc::clone(&sequence), Arc::clone(&pairings), Arc::clone(&emodel)))
             .expect("Invalid sequence/structure combination");
         let walker = LoopNeighbors::from((ltab, policy));
  
@@ -239,7 +288,8 @@ mod tests {
             println!("{}, {}", w.current_structure(), w.current_energy());
             let moves1 = w.propose_moves().collect::<Vec<_>>();
             let p = PairTable::try_from(&w.current_structure()).expect("Invalid structure?");
-            let ltab = LoopTable::try_from((sequence.clone(), &p, emodel.clone()))
+            let p = Arc::new(p);
+            let ltab = LoopTable::try_from((Arc::clone(&sequence), Arc::clone(&p), Arc::clone(&emodel)))
                 .expect("Invalid sequence/structure combination");
             let walker = LoopNeighbors::from((ltab, policy));
             let moves2 = walker.propose_moves().collect::<Vec<_>>();

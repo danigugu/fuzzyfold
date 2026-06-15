@@ -17,4 +17,3 @@ ff_energy.workspace = true
 ff_kinetics.workspace = true
 rand.workspace = true
 pyo3 = { version = "0.21", features = ["extension-module"] }
-rayon = "1.11.0"

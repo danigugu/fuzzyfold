@@ -1,0 +1,26 @@
+[package]
+name = "motifs"
+version = "0.0.0"
+edition = "2021"
+
+[lib]
+name = "motifs"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+ff_structure.workspace = true
+ff_energy.workspace = true
+ff_kinetics.workspace = true
+
+ahash        = "0.8"
+rand         = "0.9"
+rayon        = "1"
+
+# PyO3 is optional — only needed for the Python export
+pyo3         = { version = "0.21", features = ["extension-module"], optional = true }
+
+[features]
+python = ["pyo3"]
+
+[build-dependencies]
+cbindgen = "0.29.2"

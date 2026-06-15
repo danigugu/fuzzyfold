@@ -4,7 +4,7 @@ use ff_energy::EnergyModel;
 use ff_energy::NearestNeighborLoop;
 
 use crate::Move;
-use crate::movesets::loop_table::LoopTable;
+use crate::movesets::loop_table_arc::LoopTable;
 
 type Moves = Vec<(Move, i32)>;
 

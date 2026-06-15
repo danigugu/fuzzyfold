@@ -5,7 +5,7 @@ use ff_energy::EnergyModel;
 use nohash_hasher::IntMap;
 use ff_structure::DotBracketVec; 
 
-use crate::macrostates_pairlist::MacrostateRegistry;
+use crate::macrostates::MacrostateRegistry;
 
 #[derive(Debug)]
 pub enum TimelineError {
