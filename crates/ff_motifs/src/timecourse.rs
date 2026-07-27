@@ -17,7 +17,10 @@ use ff_structure::{DotBracketVec, PairTable};
 // ---------------------------------------------------------------------------
 
 pub struct TimecourseResults {
-    pub motif_match_table:     HashMap<usize, HashMap<String, usize>>,
+    pub motif_match_table:    HashMap<usize, HashMap<String, usize>>,
+    /// Sum of motif distances over all trajectories per check position.
+    /// Keyed the same way as motif_match_table: position → motif_name → sum_of_distances.
+    pub motif_distance_table: HashMap<usize, HashMap<String, usize>>,
     pub checkpoint_structures: Vec<String>,
 }
 
@@ -38,6 +41,12 @@ pub struct CotransConfig {
     pub num_sims:        usize,
     pub threshold:       f64,
     pub num_workers:     usize,   // 0 = use Rayon default (all cores)
+    /// Per-checkpoint weights (one per segment/T-domain). Empty = all 1.0.
+    pub weights:         Vec<f64>,
+    /// Scoring objective: "occupancy" (default) or "distance".
+    pub objective:       String,
+    /// Precomputed maximum possible distance per motif (motif_name → max_dist).
+    pub max_distances:   HashMap<String, usize>,
 }
 
 impl CotransConfig {
@@ -56,6 +65,8 @@ impl CotransConfig {
         let check_positions = compute_check_positions(dl_seq, &dom_length_dict)?;
         let checkpoints     = compute_checkpoints(dl_seq, &dom_length_dict, threshold)?;
 
+        let max_distances = compute_max_distances(&nl_path);
+
         Ok(Self {
             motifs,
             check_positions,
@@ -68,8 +79,26 @@ impl CotransConfig {
             num_sims,
             threshold,
             num_workers,
+            weights:       Vec::new(),
+            objective:     "occupancy".to_string(),
+            max_distances,
         })
     }
+}
+
+/// Maximum possible distance for a motif constraint string.
+/// '(' contributes 2 (wrong or absent pair), 'x' contributes 1 (position should be unpaired).
+/// ')' and '.' are not stored in ConstrPosMap and contribute 0.
+fn compute_max_distances(nl_path: &[String]) -> HashMap<String, usize> {
+    nl_path.iter().enumerate().map(|(i, s)| {
+        let name = format!("motif_{}", i + 1);
+        let max_dist: usize = s.chars().map(|c| match c {
+            '(' => 2,
+            'x' => 1,
+            _   => 0,
+        }).sum();
+        (name, max_dist)
+    }).collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -377,6 +406,8 @@ impl Simulator {
         motifs:          &str,
         check_positions: HashMap<usize, Vec<String>>,
         checkpoints:     HashMap<usize, HashMap<String, f64>>,
+        objective:       &str,
+        max_distances:   &HashMap<String, usize>,
         start:           Option<&str>,
         t_ext:           Option<f64>,
         t_end:           f64,
@@ -397,7 +428,8 @@ impl Simulator {
         cp_indices.sort_unstable();
 
         let mut accumulated = TimecourseResults {
-            motif_match_table:     HashMap::default(),
+            motif_match_table:    HashMap::default(),
+            motif_distance_table: HashMap::default(),
             checkpoint_structures: Vec::new(),
         };
 
@@ -440,16 +472,39 @@ impl Simulator {
             for (nuc, counts) in seg.motif_match_table {
                 accumulated.motif_match_table.insert(nuc, counts);
             }
+            for (nuc, dists) in seg.motif_distance_table {
+                accumulated.motif_distance_table.insert(nuc, dists);
+            }
 
             if let Some(thresholds) = checkpoints.get(&cp) {
-                let all_above = thresholds.iter().all(|(name, &threshold)| {
-                    accumulated.motif_match_table
-                        .get(&cp)
-                        .and_then(|m| m.get(name))
-                        .map(|&c| c as f64 / num_sims as f64 >= threshold)
-                        .unwrap_or(threshold == 0.0)
+                let all_pass = thresholds.iter().all(|(name, &threshold)| {
+                    if threshold <= 0.0 { return true; }
+                    match objective {
+                        "distance" => {
+                            let max_dist = max_distances.get(name).copied().unwrap_or(0);
+                            if max_dist == 0 { return true; }
+                            let dist_sum = accumulated.motif_distance_table
+                                .get(&cp)
+                                .and_then(|m| m.get(name))
+                                .copied()
+                                .unwrap_or(0);
+                            let score = dist_sum as f64
+                                / (num_sims as f64 * max_dist as f64);
+                            score <= threshold
+                        }
+                        _ => {
+                            // occupancy: threshold is upper bound on badness (1 - occ)
+                            let count = accumulated.motif_match_table
+                                .get(&cp)
+                                .and_then(|m| m.get(name))
+                                .copied()
+                                .unwrap_or(0);
+                            let badness = 1.0 - count as f64 / num_sims as f64;
+                            badness <= threshold
+                        }
+                    }
                 });
-                if !all_above { return Ok(accumulated); }
+                if !all_pass { return Ok(accumulated); }
             }
 
             if let Some(s) = next_starts { current_starts = s; }
@@ -474,81 +529,180 @@ impl Simulator {
             &config.motifs,
             config.check_positions.clone(),
             config.checkpoints.clone(),
+            &config.objective,
+            &config.max_distances,
             None,
             Some(config.t_ext),
             config.t_end,
             config.num_sims,
-            config.num_workers, 
+            config.num_workers,
         )?;
+        let (total, _) = compute_checkpoint_scores(&results, config);
+        Ok(total.clamp(0.0, 1.0))
+    }
 
-        // Group consecutive nucleotide positions together — each group
-        // corresponds to one T-domain. Positions are consecutive integers
-        // within a T-domain, with gaps between T-domains.
-        let mut sorted_positions: Vec<usize> =
-            results.motif_match_table.keys().cloned().collect();
-        sorted_positions.sort_unstable();
+    /// Like cotrans_score but also returns per-checkpoint scores.
+    /// Returns (total_score, vec![d1, d2, ..., dn]) where each di is in [0,1].
+    pub fn cotrans_score_vec(
+        &self,
+        sequence: &str,
+        config:   &CotransConfig,
+    ) -> Result<(f64, Vec<f64>), String> {
+        let results = self.simulate_timecourse_checkpoints(
+            sequence,
+            &config.motifs,
+            config.check_positions.clone(),
+            config.checkpoints.clone(),
+            &config.objective,
+            &config.max_distances,
+            None,
+            Some(config.t_ext),
+            config.t_end,
+            config.num_sims,
+            config.num_workers,
+        )?;
+        let (total, per_cp) = compute_checkpoint_scores(&results, config);
+        Ok((total.clamp(0.0, 1.0), per_cp))
+    }
 
-        // Split into groups of consecutive positions
-        let mut t_domain_groups: Vec<Vec<usize>> = Vec::new();
-        let mut current_group: Vec<usize> = Vec::new();
+    /// Compute both distance and occupancy scores from a single simulation pass.
+    /// Uses distance-based early exit. Returns (dist_score, occ_score), each in [0, 1].
+    pub fn cotrans_score_both(
+        &self,
+        sequence: &str,
+        config:   &CotransConfig,
+    ) -> Result<(f64, f64), String> {
+        let results = self.simulate_timecourse_checkpoints(
+            sequence,
+            &config.motifs,
+            config.check_positions.clone(),
+            config.checkpoints.clone(),
+            "distance",
+            &config.max_distances,
+            None,
+            Some(config.t_ext),
+            config.t_end,
+            config.num_sims,
+            config.num_workers,
+        )?;
+        let (dist, _) = compute_checkpoint_scores_for_obj(&results, config, "distance");
+        let (occ,  _) = compute_checkpoint_scores_for_obj(&results, config, "occupancy");
+        Ok((dist.clamp(0.0, 1.0), occ.clamp(0.0, 1.0)))
+    }
+}
 
-        for &pos in &sorted_positions {
-            if current_group.is_empty()
-                || pos == *current_group.last().unwrap() + 1
-            {
-                current_group.push(pos);
-            } else {
-                t_domain_groups.push(current_group.clone());
-                current_group = vec![pos];
-            }
-        }
-        if !current_group.is_empty() {
-            t_domain_groups.push(current_group);
-        }
+// ---------------------------------------------------------------------------
+// Shared per-checkpoint scoring helper
+// Returns (total_weighted_score, per_checkpoint_normalized_scores)
+// ---------------------------------------------------------------------------
 
-        // pathlength = number of T-domains defined in config (not just observed)
-        let pathlength = config.checkpoints.len() as f64;
+fn compute_checkpoint_scores(
+    results: &TimecourseResults,
+    config:  &CotransConfig,
+) -> (f64, Vec<f64>) {
+    compute_checkpoint_scores_for_obj(results, config, &config.objective)
+}
 
-        // For each observed T-domain group, compute average motif occupancy.
-        // Only count hits for the expected motif (not 'Unassigned').
-        // Missing T-domains (checkpoint failed before reaching them) contribute 0.
-        let mut total_occupancy = 0.0_f64;
+/// Like compute_checkpoint_scores but with an explicit objective override.
+/// Allows computing both distance and occupancy from the same TimecourseResults
+/// without re-running the simulation.
+fn compute_checkpoint_scores_for_obj(
+    results:   &TimecourseResults,
+    config:    &CotransConfig,
+    objective: &str,
+) -> (f64, Vec<f64>) {
+    // Build T-domain groups from ALL expected check positions (not just observed)
+    // so that non-reached checkpoints (early exit) get worst-case penalty.
+    let mut all_positions: Vec<usize> = config.check_positions.keys().cloned().collect();
+    all_positions.sort_unstable();
 
-        for group in &t_domain_groups {
-            let mut group_hits = 0usize;
-            let mut group_positions = 0usize;
+    let mut t_domain_groups: Vec<(Vec<usize>, String)> = Vec::new();
+    let mut current_group:   Vec<usize>                = Vec::new();
 
-            for pos in group {
-                if let Some(counts) = results.motif_match_table.get(pos) {
-                    // sum only named motif hits, exclude 'Unassigned'
-                    let hits: usize = counts.iter()
-                        .filter(|(name, _)| *name != "Unassigned")
-                        .map(|(_, &c)| c)
-                        .sum();
-                    group_hits      += hits;
-                    group_positions += 1;
-                }
-            }
-
-            // average occupancy across positions in this T-domain,
-            // normalized by num_sims
-            if group_positions > 0 {
-                let avg = group_hits as f64
-                    / (group_positions as f64 * config.num_sims as f64);
-                total_occupancy += avg;
-            }
-        }
-
-        // score = (pathlength - sum of avg occupancies) / pathlength
-        // range: [0, 1], lower is better for gradient descent
-        // 0 = perfect cotranscriptional folding path
-        // 1 = complete failure at first checkpoint
-        let score = if pathlength > 0.0 {
-            (pathlength - total_occupancy) / pathlength
+    for &pos in &all_positions {
+        if current_group.is_empty() || pos == *current_group.last().unwrap() + 1 {
+            current_group.push(pos);
         } else {
-            0.0
-        };
-        Ok(score)
+            let motif_name = config.check_positions[&current_group[0]][0].clone();
+            t_domain_groups.push((current_group.clone(), motif_name));
+            current_group = vec![pos];
+        }
+    }
+    if !current_group.is_empty() {
+        let motif_name = config.check_positions[&current_group[0]][0].clone();
+        t_domain_groups.push((current_group, motif_name));
+    }
+
+    let n_groups = t_domain_groups.len();
+    let weights: Vec<f64> = if config.weights.is_empty() {
+        vec![1.0; n_groups]
+    } else {
+        let mut w = config.weights.clone();
+        w.resize(n_groups, 1.0);
+        w
+    };
+    let weight_sum: f64 = weights.iter().sum::<f64>().max(f64::EPSILON);
+
+    let mut per_cp: Vec<f64> = Vec::with_capacity(n_groups);
+    let mut total  = 0.0_f64;
+
+    match objective {
+        "distance" => {
+            for (i, (group, motif_name)) in t_domain_groups.iter().enumerate() {
+                let w        = weights[i];
+                let max_dist = config.max_distances.get(motif_name).copied().unwrap_or(0);
+
+                let norm_dist = if max_dist == 0 {
+                    0.0
+                } else {
+                    let mut dist_sum  = 0usize;
+                    let mut n_reached = 0usize;
+                    for pos in group {
+                        if let Some(dist_map) = results.motif_distance_table.get(pos) {
+                            dist_sum  += dist_map.get(motif_name).copied().unwrap_or(0);
+                            n_reached += 1;
+                        }
+                    }
+                    if n_reached == 0 {
+                        1.0
+                    } else {
+                        dist_sum as f64
+                            / (n_reached as f64 * config.num_sims as f64 * max_dist as f64)
+                    }
+                };
+                per_cp.push(norm_dist.clamp(0.0, 1.0));
+                total += w * norm_dist;
+            }
+            (total / weight_sum, per_cp)
+        }
+        _ => {
+            // "occupancy" (default)
+            let mut total_occ = 0.0_f64;
+            for (i, (group, motif_name)) in t_domain_groups.iter().enumerate() {
+                let w = weights[i];
+                let mut hits  = 0usize;
+                let mut n_pos = 0usize;
+                for pos in group {
+                    if let Some(counts) = results.motif_match_table.get(pos) {
+                        let h: usize = counts.iter()
+                            .filter(|(name, _)| *name != "Unassigned")
+                            .map(|(_, &c)| c)
+                            .sum();
+                        hits  += h;
+                        n_pos += 1;
+                    }
+                }
+                let cp_occ = if n_pos > 0 {
+                    hits as f64 / (n_pos as f64 * config.num_sims as f64)
+                } else {
+                    0.0
+                };
+                per_cp.push((1.0 - cp_occ).clamp(0.0, 1.0));
+                total_occ += w * cp_occ;
+                let _ = motif_name;
+            }
+            (1.0 - total_occ / weight_sum, per_cp)
+        }
     }
 }
 
@@ -597,21 +751,32 @@ fn build_motif_registry(
 }
 
 fn merge_results(results: Vec<TimecourseResults>) -> TimecourseResults {
-    let mut merged: HashMap<usize, HashMap<String, usize>> = HashMap::default();
+    let mut merged_match: HashMap<usize, HashMap<String, usize>> = HashMap::default();
+    let mut merged_dist:  HashMap<usize, HashMap<String, usize>> = HashMap::default();
     let mut checkpoint_structures = Vec::with_capacity(results.len());
 
     for r in results {
         for (tp, counts) in r.motif_match_table {
-            let slot = merged.entry(tp).or_insert_with(HashMap::default);
+            let slot = merged_match.entry(tp).or_insert_with(HashMap::default);
             for (name, count) in counts {
                 slot.entry(name).and_modify(|c| *c += count).or_insert(count);
+            }
+        }
+        for (tp, dists) in r.motif_distance_table {
+            let slot = merged_dist.entry(tp).or_insert_with(HashMap::default);
+            for (name, dist) in dists {
+                slot.entry(name).and_modify(|d| *d += dist).or_insert(dist);
             }
         }
         if let Some(s) = r.checkpoint_structures.into_iter().next() {
             checkpoint_structures.push(s);
         }
     }
-    TimecourseResults { motif_match_table: merged, checkpoint_structures }
+    TimecourseResults {
+        motif_match_table:    merged_match,
+        motif_distance_table: merged_dist,
+        checkpoint_structures,
+    }
 }
 
 fn build_parallel_runs(
@@ -680,7 +845,8 @@ struct SimulationRunner {
 impl SimulationRunner {
     fn run(mut self, use_3ws: bool, use_4ws: bool) -> TimecourseResults {
         let mut results = TimecourseResults {
-            motif_match_table:     HashMap::default(),
+            motif_match_table:    HashMap::default(),
+            motif_distance_table: HashMap::default(),
             checkpoint_structures: Vec::new(),
         };
 
@@ -700,15 +866,23 @@ impl SimulationRunner {
                     let global_nuc = local_nuc + offset;
                     if let Some(names) = self.check_positions.get(&global_nuc) {
                         if let Ok(structure) = DotBracketVec::try_from(w.to_string().as_str()) {
-                            for classification in
-                                self.motif_registry.classify_specific_motifs(&structure, names)
-                            {
+                            let (classifications, distances) =
+                                self.motif_registry.classify_and_distance(&structure, names);
+                            for classification in classifications {
                                 results.motif_match_table
                                     .entry(global_nuc)
                                     .or_insert_with(HashMap::default)
                                     .entry(classification)
                                     .and_modify(|c| *c += 1)
                                     .or_insert(1);
+                            }
+                            for (name, dist) in distances {
+                                results.motif_distance_table
+                                    .entry(global_nuc)
+                                    .or_insert_with(HashMap::default)
+                                    .entry(name)
+                                    .and_modify(|d| *d += dist)
+                                    .or_insert(dist);
                             }
                         }
                     }

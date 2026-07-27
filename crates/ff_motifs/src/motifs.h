@@ -80,14 +80,87 @@ int sim_timecourse_checkpoints(struct SimHandle *sim_handle,
                                uintptr_t max_timepoints);
 
 /**
+ * Set per-checkpoint weights for a config.
+ * weights must be a pointer to n_weights doubles, one per checkpoint segment (in order).
+ * If fewer weights than checkpoints, remaining checkpoints use weight 1.0.
+ * Pass null or n_weights=0 to reset to equal weights.
+ */
+void config_set_weights(struct ConfigHandle *handle, const double *weights, uintptr_t n_weights);
+
+/**
+ * Set the scoring objective for a config.
+ * Valid values: "occupancy" (default) or "distance".
+ */
+void config_set_objective(struct ConfigHandle *handle, const char *objective);
+
+/**
  * Scalar objective for gradient descent.
- * score = pathlength - sum(avg T-domain occupancies)
- * range: [0, pathlength], lower is better.
- * Returns -1.0 on error.
+ * Dispatches to occupancy or distance scoring based on config.objective.
+ * Returns score in [0, 1] (lower is better), or -1.0 on error.
  */
 double sim_score(struct SimHandle *sim_handle,
                  struct ConfigHandle *config_handle,
                  const char *sequence);
+
+/**
+ * Objective + per-checkpoint scores for gradient descent with experience replay.
+ *
+ * Writes into out_scores[0..n+1]:
+ *   out_scores[0]   = total weighted score (same as sim_score)
+ *   out_scores[1..] = per-checkpoint normalized distances/scores, one per checkpoint
+ *
+ * Returns n+1 (total entries written), or -1 on error.
+ * max_scores must be >= n_checkpoints + 1; values beyond n+1 are not written.
+ */
+int sim_score_vec(struct SimHandle *sim_handle,
+                  struct ConfigHandle *config_handle,
+                  const char *sequence,
+                  double *out_scores,
+                  uintptr_t max_scores);
+
+/**
+ * Batch scalar scoring — evaluates n_seqs sequences in parallel using Rayon.
+ *
+ * sequences: array of n_seqs C-string pointers (each a null-terminated RNA sequence).
+ * out_scores: caller-allocated array of n_seqs doubles; receives the score for each
+ *             sequence (same semantics as sim_score: [0,1] lower-is-better, -1.0 on error).
+ *
+ * Returns n_seqs on success, or -1 if either handle is null.
+ * Individual sequences that fail to score write -1.0 into their out_scores slot.
+ */
+int sim_score_batch(struct SimHandle *sim_handle,
+                    struct ConfigHandle *config_handle,
+                    const char *const *sequences,
+                    uintptr_t n_seqs,
+                    double *out_scores);
+
+/**
+ * Compute both distance and occupancy scores from a single simulation pass.
+ *
+ * Uses distance-based early exit. Writes dist_score and occ_score to the
+ * respective output pointers (each in [0, 1], lower is better).
+ * Returns 0 on success, -1 on error.
+ */
+int sim_score_both(struct SimHandle *sim_handle,
+                   struct ConfigHandle *config_handle,
+                   const char *sequence,
+                   double *out_dist,
+                   double *out_occ);
+
+/**
+ * Batch combined scoring — evaluates n_seqs sequences in parallel using Rayon.
+ *
+ * sequences: array of n_seqs C-string pointers.
+ * out_dist, out_occ: caller-allocated arrays of n_seqs doubles.
+ * Each entry receives [0, 1] lower-is-better scores, or -1.0 on per-sequence error.
+ * Returns n_seqs on success, -1 if handles are null.
+ */
+int sim_score_both_batch(struct SimHandle *sim_handle,
+                         struct ConfigHandle *config_handle,
+                         const char *const *sequences,
+                         uintptr_t n_seqs,
+                         double *out_dist,
+                         double *out_occ);
 
 #ifdef __cplusplus
 }  // extern "C"
