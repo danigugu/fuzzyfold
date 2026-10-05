@@ -11,6 +11,8 @@ include = [
     "config_destroy",
     "config_nl_path_len",
     "config_nl_path_entry",
+    "config_set_weights",
+    "config_set_objective",
     "sim_timecourse",
     "sim_timecourse_checkpoints",
     "sim_score",

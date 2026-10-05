@@ -88,6 +88,37 @@ int sim_timecourse_checkpoints(struct SimHandle *sim_handle,
 void config_set_weights(struct ConfigHandle *handle, const double *weights, uintptr_t n_weights);
 
 /**
+ * Set the T-domain occupancy scoring mode for a config and rebuild check_positions.
+ * "full" (default): average occupancy over every T-domain nucleotide position.
+ * "endpoint":       score only at the last T-domain position per segment.
+ *                   Use with flexible T-domains to reward keeping T short while
+ *                   achieving high occupancy at the final transcribed position.
+ */
+void config_set_t_scoring(struct ConfigHandle *handle, const char *mode);
+
+/**
+ * Cap per-segment occupancy at this threshold before weighting (default 1.0 = no cap).
+ * Values outside [0,1] are clamped. Use with endpoint mode to prevent
+ * over-extending T domains for marginal occupancy gains.
+ */
+void config_set_t_occ_threshold(struct ConfigHandle *handle, double threshold);
+
+/**
+ * Penalty subtracted from effective occupancy per extra T-domain nucleotide
+ * (actual_len - min_len). Default 0.0 (no penalty). Requires t_min_lengths to be set.
+ */
+void config_set_t_len_penalty(struct ConfigHandle *handle, double penalty);
+
+/**
+ * Set minimum lengths for T domains. Required for t_len_penalty to take effect.
+ * keys[i] is the T-domain name (e.g. "T0"), vals[i] is its minimum length.
+ */
+void config_set_t_min_lengths(struct ConfigHandle *handle,
+                              const char *const *keys,
+                              const uintptr_t *vals,
+                              uintptr_t n);
+
+/**
  * Set the scoring objective for a config.
  * Valid values: "occupancy" (default) or "distance".
  */
@@ -146,6 +177,28 @@ int sim_score_both(struct SimHandle *sim_handle,
                    const char *sequence,
                    double *out_dist,
                    double *out_occ);
+
+/**
+ * Like sim_score_both, but also fills per-segment breakdowns.
+ *
+ * out_dist:      aggregated distance score  (0=best, 1=worst).
+ * out_occ:       aggregated occupancy score (0=best, 1=worst, inverted for consistency).
+ * out_dist_segs: per-segment distance  [n_segs] (0=best, 1=worst).
+ * out_occ_segs:  per-segment raw occ   [n_segs] (1=best, 0=worst — NOT inverted).
+ * n_segs:        size of out_dist_segs / out_occ_segs; use config_nl_path_len().
+ *
+ * Null pointers for out_dist / out_occ / out_dist_segs / out_occ_segs are tolerated
+ * (those outputs are simply skipped).  n_segs may be 0 to skip per-segment output.
+ * Returns 0 on success, -1 on error.
+ */
+int sim_score_detailed(struct SimHandle *sim_handle,
+                       struct ConfigHandle *config_handle,
+                       const char *sequence,
+                       double *out_dist,
+                       double *out_occ,
+                       double *out_dist_segs,
+                       double *out_occ_segs,
+                       uintptr_t n_segs);
 
 /**
  * Batch combined scoring — evaluates n_seqs sequences in parallel using Rayon.

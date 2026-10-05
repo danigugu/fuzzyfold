@@ -267,6 +267,65 @@ pub extern "C" fn config_set_weights(
     }
 }
 
+/// Set the T-domain occupancy scoring mode for a config and rebuild check_positions.
+/// "full" (default): average occupancy over every T-domain nucleotide position.
+/// "endpoint":       score only at the last T-domain position per segment.
+///                   Use with flexible T-domains to reward keeping T short while
+///                   achieving high occupancy at the final transcribed position.
+#[no_mangle]
+pub extern "C" fn config_set_t_scoring(
+    handle: *mut ConfigHandle,
+    mode:   *const c_char,
+) {
+    if handle.is_null() || mode.is_null() { return; }
+    let mode_str = unsafe {
+        match CStr::from_ptr(mode).to_str() {
+            Ok(s)  => s.to_owned(),
+            Err(_) => return,
+        }
+    };
+    unsafe { (*handle).inner.set_t_scoring(&mode_str); }
+}
+
+/// Cap per-segment occupancy at this threshold before weighting (default 1.0 = no cap).
+/// Values outside [0,1] are clamped. Use with endpoint mode to prevent
+/// over-extending T domains for marginal occupancy gains.
+#[no_mangle]
+pub extern "C" fn config_set_t_occ_threshold(handle: *mut ConfigHandle, threshold: f64) {
+    if handle.is_null() { return; }
+    unsafe { (*handle).inner.set_t_occ_threshold(threshold); }
+}
+
+/// Penalty subtracted from effective occupancy per extra T-domain nucleotide
+/// (actual_len - min_len). Default 0.0 (no penalty). Requires t_min_lengths to be set.
+#[no_mangle]
+pub extern "C" fn config_set_t_len_penalty(handle: *mut ConfigHandle, penalty: f64) {
+    if handle.is_null() { return; }
+    unsafe { (*handle).inner.set_t_len_penalty(penalty); }
+}
+
+/// Set minimum lengths for T domains. Required for t_len_penalty to take effect.
+/// keys[i] is the T-domain name (e.g. "T0"), vals[i] is its minimum length.
+#[no_mangle]
+pub extern "C" fn config_set_t_min_lengths(
+    handle: *mut ConfigHandle,
+    keys:   *const *const c_char,
+    vals:   *const usize,
+    n:      usize,
+) {
+    if handle.is_null() || keys.is_null() || vals.is_null() || n == 0 { return; }
+    let vals_slice: &[usize] = unsafe { std::slice::from_raw_parts(vals, n) };
+    let mut key_strs: Vec<&str> = Vec::with_capacity(n);
+    for i in 0..n {
+        let cstr = unsafe { CStr::from_ptr(*keys.add(i)) };
+        match cstr.to_str() {
+            Ok(s)  => key_strs.push(s),
+            Err(_) => return,
+        }
+    }
+    unsafe { (*handle).inner.set_t_min_lengths(&key_strs, vals_slice); }
+}
+
 /// Set the scoring objective for a config.
 /// Valid values: "occupancy" (default) or "distance".
 #[no_mangle]
@@ -455,6 +514,65 @@ pub extern "C" fn sim_score_both(
         }
         Err(e) => {
             eprintln!("sim_score_both error: {}", e);
+            -1
+        }
+    }
+}
+
+/// Like sim_score_both, but also fills per-segment breakdowns.
+///
+/// out_dist:      aggregated distance score  (0=best, 1=worst).
+/// out_occ:       aggregated occupancy score (0=best, 1=worst, inverted for consistency).
+/// out_dist_segs: per-segment distance  [n_segs] (0=best, 1=worst).
+/// out_occ_segs:  per-segment raw occ   [n_segs] (1=best, 0=worst — NOT inverted).
+/// n_segs:        size of out_dist_segs / out_occ_segs; use config_nl_path_len().
+///
+/// Null pointers for out_dist / out_occ / out_dist_segs / out_occ_segs are tolerated
+/// (those outputs are simply skipped).  n_segs may be 0 to skip per-segment output.
+/// Returns 0 on success, -1 on error.
+#[no_mangle]
+pub extern "C" fn sim_score_detailed(
+    sim_handle:    *mut SimHandle,
+    config_handle: *mut ConfigHandle,
+    sequence:      *const c_char,
+    out_dist:      *mut f64,
+    out_occ:       *mut f64,
+    out_dist_segs: *mut f64,
+    out_occ_segs:  *mut f64,
+    n_segs:        usize,
+) -> c_int {
+    if sim_handle.is_null() || config_handle.is_null() || sequence.is_null() {
+        return -1;
+    }
+    let seq = unsafe {
+        match CStr::from_ptr(sequence).to_str() {
+            Ok(s)  => s.to_owned(),
+            Err(_) => return -1,
+        }
+    };
+
+    let sim    = unsafe { &(*sim_handle).inner };
+    let config = unsafe { &(*config_handle).inner };
+
+    match sim.cotrans_score_both_detailed(&seq, config) {
+        Ok((dist, occ, dist_segs, occ_segs_raw)) => {
+            if !out_dist.is_null() { unsafe { *out_dist = dist; } }
+            if !out_occ.is_null()  { unsafe { *out_occ  = occ;  } }
+            if n_segs > 0 {
+                let n = n_segs.min(dist_segs.len()).min(occ_segs_raw.len());
+                for i in 0..n {
+                    if !out_dist_segs.is_null() {
+                        unsafe { *out_dist_segs.add(i) = dist_segs[i]; }
+                    }
+                    if !out_occ_segs.is_null() {
+                        unsafe { *out_occ_segs.add(i) = occ_segs_raw[i]; }
+                    }
+                }
+            }
+            0
+        }
+        Err(e) => {
+            eprintln!("sim_score_detailed error: {}", e);
             -1
         }
     }

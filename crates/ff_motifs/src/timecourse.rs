@@ -47,6 +47,21 @@ pub struct CotransConfig {
     pub objective:       String,
     /// Precomputed maximum possible distance per motif (motif_name → max_dist).
     pub max_distances:   HashMap<String, usize>,
+    /// T-domain occupancy scoring mode: "full" (average over all T positions, default)
+    /// or "endpoint" (score only at the last T-domain position per segment).
+    pub t_scoring:        String,
+    /// Cap on per-segment occupancy before weighting. Default 1.0 (no cap).
+    /// Useful with "endpoint" mode to avoid over-extending T domains.
+    pub t_occ_threshold:  f64,
+    /// Penalty subtracted from effective occupancy per extra T-domain nucleotide
+    /// (actual_len - min_len). Default 0.0 (no penalty).
+    pub t_len_penalty:    f64,
+    /// Min lengths for T domains. Used by t_len_penalty to compute extra_len.
+    /// Empty = all penalties are 0 (no flex or no penalty configured).
+    pub dom_t_min_dict:   HashMap<String, usize>,
+    /// Ordered list of T domain names (e.g. ["T0","T1","T2","T3"]),
+    /// one per segment, same order as t_domain_groups in scoring.
+    pub t_domain_names:   Vec<String>,
 }
 
 impl CotransConfig {
@@ -62,10 +77,12 @@ impl CotransConfig {
     ) -> Result<Self, String> {
         let nl_path         = compute_nl_path(acfp, dl_seq, &dom_length_dict)?;
         let motifs          = compute_motifs(&nl_path)?;
-        let check_positions = compute_check_positions(dl_seq, &dom_length_dict)?;
+        let check_positions = compute_check_positions(dl_seq, &dom_length_dict, "full")?;
         let checkpoints     = compute_checkpoints(dl_seq, &dom_length_dict, threshold)?;
 
         let max_distances = compute_max_distances(&nl_path);
+
+        let t_domain_names = compute_t_domain_names(dl_seq);
 
         Ok(Self {
             motifs,
@@ -79,10 +96,44 @@ impl CotransConfig {
             num_sims,
             threshold,
             num_workers,
-            weights:       Vec::new(),
-            objective:     "occupancy".to_string(),
+            weights:          Vec::new(),
+            objective:        "occupancy".to_string(),
             max_distances,
+            t_scoring:        "full".to_string(),
+            t_occ_threshold:  1.0,
+            t_len_penalty:    0.0,
+            dom_t_min_dict:   HashMap::default(),
+            t_domain_names,
         })
+    }
+
+    /// Change the T-domain scoring mode and rebuild check_positions accordingly.
+    /// "full" (default): average occupancy over all T-domain positions.
+    /// "endpoint": score only at the last T-domain position per segment.
+    pub fn set_t_scoring(&mut self, mode: &str) {
+        self.t_scoring = mode.to_string();
+        if let Ok(new_cp) = compute_check_positions(&self.dl_seq, &self.dom_length_dict, mode) {
+            self.check_positions = new_cp;
+        }
+    }
+
+    /// Cap per-segment endpoint occupancy at this value (default 1.0 = no cap).
+    /// Values outside [0, 1] are clamped.
+    pub fn set_t_occ_threshold(&mut self, threshold: f64) {
+        self.t_occ_threshold = threshold.clamp(0.0, 1.0);
+    }
+
+    /// Penalty subtracted from effective occupancy per extra T-domain nucleotide.
+    /// extra_len = actual_T_len - min_T_len (requires dom_t_min_dict to be set).
+    pub fn set_t_len_penalty(&mut self, penalty: f64) {
+        self.t_len_penalty = penalty.max(0.0);
+    }
+
+    /// Set minimum lengths for T domains. Used to compute extra_len for t_len_penalty.
+    pub fn set_t_min_lengths(&mut self, keys: &[&str], vals: &[usize]) {
+        for (k, &v) in keys.iter().zip(vals.iter()) {
+            self.dom_t_min_dict.insert(k.to_string(), v);
+        }
     }
 }
 
@@ -105,6 +156,17 @@ fn compute_max_distances(nl_path: &[String]) -> HashMap<String, usize> {
 // Utility functions — all take rna_struct, return precomputed data
 // ---------------------------------------------------------------------------
 
+/// Returns the ordered list of T-domain base names, one per dl_seq segment.
+/// Segments are groups of domains ending in a T domain. The T domain name is
+/// the last token of each segment (e.g. "T0", "T1", "T2", "T3").
+fn compute_t_domain_names(dl_seq: &str) -> Vec<String> {
+    parse_dl_seq(dl_seq)
+        .into_iter()
+        .filter_map(|seg| seg.into_iter().last())
+        .map(|tok| get_base_name(&tok).to_string())
+        .collect()
+}
+
 fn compute_motifs(nl_path: &[String]) -> Result<String, String> {
     if nl_path.is_empty() {
         return Err("nl_path is empty".into());
@@ -124,6 +186,7 @@ fn compute_motifs(nl_path: &[String]) -> Result<String, String> {
 fn compute_check_positions(
     dl_seq:          &str,
     dom_length_dict: &HashMap<String, usize>,
+    t_scoring:       &str,   // "full": all T positions; "endpoint": last T position only
 ) -> Result<HashMap<usize, Vec<String>>, String> {
     let segments = parse_dl_seq(dl_seq);
     let mut check_positions: HashMap<usize, Vec<String>> = HashMap::default();
@@ -142,12 +205,21 @@ fn compute_check_positions(
                        base[1..].parse::<usize>().is_ok();
 
             if is_t {
-                // map every nucleotide in this T-domain to the motif
-                for pos in nucleotide_pos..nucleotide_pos + length {
+                if t_scoring == "endpoint" {
+                    // only the last nucleotide of this T-domain
+                    let last_pos = nucleotide_pos + length - 1;
                     check_positions
-                        .entry(pos)
+                        .entry(last_pos)
                         .or_insert_with(Vec::new)
                         .push(motif_name.clone());
+                } else {
+                    // "full" (default): every nucleotide in this T-domain
+                    for pos in nucleotide_pos..nucleotide_pos + length {
+                        check_positions
+                            .entry(pos)
+                            .or_insert_with(Vec::new)
+                            .push(motif_name.clone());
+                    }
                 }
             }
 
@@ -515,6 +587,76 @@ impl Simulator {
     }
 
     // -----------------------------------------------------------------------
+    // Structure ensemble — per-trajectory dot-bracket at each checkpoint
+    // Runs cotranscriptional simulation segment-by-segment (no motif checking)
+    // and returns the final structure of each trajectory at every checkpoint.
+    // -----------------------------------------------------------------------
+
+    pub fn simulate_structure_ensemble(
+        &self,
+        sequence:       &str,
+        checkpoint_nts: Vec<usize>,
+        start:          Option<&str>,
+        t_ext:          Option<f64>,
+        t_end:          f64,
+        num_sims:       usize,
+        num_workers:    usize,
+    ) -> Result<Vec<(usize, Vec<String>)>, String> {
+        let sequence = Arc::new(
+            NucleotideVec::try_from_rna(sequence).map_err(|e| e.to_string())?
+        );
+        let start_pt  = parse_start(start)?;
+        let start_len = start.map(|s| s.len()).unwrap_or(1);
+        let times     = build_times(sequence.len(), start_len, t_ext, t_end);
+        let registry  = Arc::new(MotifRegistry::from((Arc::clone(&sequence), Arc::clone(&self.energy_model))));
+        let empty_checks = Arc::new(HashMap::default());
+
+        let mut cp_indices = checkpoint_nts;
+        cp_indices.sort_unstable();
+
+        let mut out: Vec<(usize, Vec<String>)> = Vec::new();
+        let mut current_starts = vec![start_pt; num_sims];
+        let mut seg_start = 0usize;
+
+        for &cp in &cp_indices {
+            if cp >= times.len() { continue; }
+
+            let seg_times = Arc::new(times[seg_start..=cp].to_vec());
+            let owned     = std::mem::take(&mut current_starts);
+
+            let per_sim = build_parallel_runs(
+                Arc::clone(&sequence),
+                owned,
+                Arc::clone(&self.energy_model),
+                Arc::clone(&self.rate_model),
+                seg_times,
+                Arc::clone(&registry),
+                Arc::clone(&empty_checks),
+                seg_start,
+                true,
+                num_workers,
+            );
+
+            let (structures, next_starts): (Vec<String>, Vec<PairTable>) =
+                per_sim.into_iter().map(|r| {
+                    let s = r.checkpoint_structures.into_iter().next()
+                               .expect("sim produced no checkpoint structure");
+                    let db = DotBracketVec::try_from(s.as_str())
+                               .expect("invalid dot-bracket from sim");
+                    let pt = PairTable::try_from(&db)
+                               .expect("invalid pair table from sim");
+                    (s, pt)
+                }).unzip();
+
+            out.push((cp, structures));
+            current_starts = next_starts;
+            seg_start = cp + 1;
+        }
+
+        Ok(out)
+    }
+
+    // -----------------------------------------------------------------------
     // Scalar objective for C++ gradient descent
     // Returns fraction of sims reaching rna_struct, negated (lower = better)
     // -----------------------------------------------------------------------
@@ -563,6 +705,35 @@ impl Simulator {
         )?;
         let (total, per_cp) = compute_checkpoint_scores(&results, config);
         Ok((total.clamp(0.0, 1.0), per_cp))
+    }
+
+    /// Like cotrans_score_both but also returns per-segment breakdowns.
+    /// Returns (dist_agg, occ_agg, dist_per_seg, occ_per_seg_raw).
+    ///   dist_per_seg[i]: normalised distance for segment i (0=best, 1=worst)
+    ///   occ_per_seg_raw[i]: raw occupancy for segment i    (1=best, 0=worst)
+    pub fn cotrans_score_both_detailed(
+        &self,
+        sequence: &str,
+        config:   &CotransConfig,
+    ) -> Result<(f64, f64, Vec<f64>, Vec<f64>), String> {
+        let results = self.simulate_timecourse_checkpoints(
+            sequence,
+            &config.motifs,
+            config.check_positions.clone(),
+            config.checkpoints.clone(),
+            "distance",
+            &config.max_distances,
+            None,
+            Some(config.t_ext),
+            config.t_end,
+            config.num_sims,
+            config.num_workers,
+        )?;
+        let (dist, dist_segs) = compute_checkpoint_scores_for_obj(&results, config, "distance");
+        let (occ,  occ_segs)  = compute_checkpoint_scores_for_obj(&results, config, "occupancy");
+        // occ_segs[i] = (1 - raw_occ) — convert to raw occupancy (1=best)
+        let occ_segs_raw: Vec<f64> = occ_segs.iter().map(|&x| 1.0 - x).collect();
+        Ok((dist.clamp(0.0, 1.0), occ.clamp(0.0, 1.0), dist_segs, occ_segs_raw))
     }
 
     /// Compute both distance and occupancy scores from a single simulation pass.
@@ -697,8 +868,19 @@ fn compute_checkpoint_scores_for_obj(
                 } else {
                     0.0
                 };
-                per_cp.push((1.0 - cp_occ).clamp(0.0, 1.0));
-                total_occ += w * cp_occ;
+                // Apply occupancy threshold and length penalty.
+                // threshold caps per-segment occupancy (for combined_first: avoid
+                // extending T domains just to squeeze out the last few %).
+                // penalty discourages using extra T nucleotides beyond T_min.
+                let t_dom = config.t_domain_names.get(i).map(|s| s.as_str()).unwrap_or("");
+                let actual_len = config.dom_length_dict.get(t_dom).copied().unwrap_or(0);
+                let min_len    = config.dom_t_min_dict.get(t_dom).copied().unwrap_or(actual_len);
+                let extra_len  = actual_len.saturating_sub(min_len) as f64;
+                let eff_occ = (cp_occ.min(config.t_occ_threshold)
+                              - config.t_len_penalty * extra_len)
+                              .clamp(0.0, 1.0);
+                per_cp.push((1.0 - eff_occ).clamp(0.0, 1.0));
+                total_occ += w * eff_occ;
                 let _ = motif_name;
             }
             (1.0 - total_occ / weight_sum, per_cp)
@@ -889,6 +1071,20 @@ impl SimulationRunner {
                 });
 
                 if self.record_final_structure {
+                    // Extend by one nucleotide so the next segment starts with
+                    // the correct RNA length.  co_simulate_checked skips the
+                    // final extension, so without this the checkpoint structure
+                    // would be 1 nt shorter than the next segment expects.
+                    // The deficit would accumulate across segments, causing
+                    // false-zero occupancy at early T-domain positions.
+                    //
+                    // Skip apply_extension() at the very end of the sequence
+                    // (when we are already at the last nucleotide); the caller
+                    // may still want the structure without triggering an
+                    // out-of-bounds extension.
+                    if ssa.current_structure().len() < self.sequence.len() {
+                        ssa.apply_extension();
+                    }
                     results.checkpoint_structures =
                         vec![ssa.current_structure().to_string()];
                 }

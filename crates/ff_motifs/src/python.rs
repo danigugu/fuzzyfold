@@ -2,6 +2,7 @@ use pyo3::prelude::*;
 use pyo3::exceptions::PyValueError;
 use pyo3::types::{PyDict, PyList};
 use ahash::HashMap;
+use rayon::prelude::*;
 
 use crate::timecourse::{Simulator, TimecourseResults, CotransConfig};
 
@@ -121,14 +122,37 @@ impl PyCotransConfig {
         self.inner.num_workers 
     }
 
+    fn set_objective(&mut self, objective: &str) {
+        self.inner.objective = objective.to_string();
+    }
+
+    fn set_weights(&mut self, weights: Vec<f64>) {
+        self.inner.weights = weights;
+    }
+
+    fn set_num_sims(&mut self, num_sims: usize) {
+        self.inner.num_sims = num_sims;
+    }
+
+    #[getter]
+    fn objective(&self) -> &str {
+        &self.inner.objective
+    }
+
+    #[getter]
+    fn weights(&self) -> Vec<f64> {
+        self.inner.weights.clone()
+    }
+
     fn __repr__(&self) -> String {
         format!(
-            "CotransConfig(dl_seq='{}', t_ext={}, t_end={}, num_sims={}, threshold={}, segments={})",
+            "CotransConfig(dl_seq='{}', t_ext={}, t_end={}, num_sims={}, threshold={}, objective='{}', segments={})",
             self.inner.dl_seq,
             self.inner.t_ext,
             self.inner.t_end,
             self.inner.num_sims,
             self.inner.threshold,
+            self.inner.objective,
             self.inner.nl_path.len(),
         )
     }
@@ -190,7 +214,7 @@ impl MotifCheckSimulator {
     // simulate_timecourse_checkpoints
     // -----------------------------------------------------------------------
 
-    #[pyo3(signature = (sequence, motifs, check_positions, checkpoints, start=None, t_ext=0.02, t_end=0.02, num_sims=100, num_workers=0))]
+    #[pyo3(signature = (sequence, motifs, check_positions, checkpoints, objective="occupancy", max_distances=None, start=None, t_ext=0.02, t_end=0.02, num_sims=100, num_workers=0))]
     fn simulate_timecourse_checkpoints(
         &self,
         py:              Python<'_>,
@@ -198,20 +222,56 @@ impl MotifCheckSimulator {
         motifs:          &str,
         check_positions: HashMap<usize, Vec<String>>,
         checkpoints:     HashMap<usize, HashMap<String, f64>>,
+        objective:       &str,
+        max_distances:   Option<HashMap<String, usize>>,
         start:           Option<&str>,
         t_ext:           Option<f64>,
         t_end:           f64,
         num_sims:        usize,
         num_workers:     usize,
     ) -> PyResult<PyObject> {
+        let max_dist_map = max_distances.unwrap_or_default();
         let results = py.allow_threads(|| {
             self.inner.simulate_timecourse_checkpoints(
                 sequence, motifs, check_positions, checkpoints,
+                objective, &max_dist_map,
                 start, t_ext, t_end, num_sims, num_workers,
             )
         }).map_err(PyValueError::new_err)?;
 
         to_python_list(py, results)
+    }
+
+    // -----------------------------------------------------------------------
+    // simulate_structure_ensemble — per-trajectory structures at checkpoints
+    // -----------------------------------------------------------------------
+
+    #[pyo3(signature = (sequence, checkpoint_nts, start=None, t_ext=0.02, t_end=0.02, num_sims=100, num_workers=0))]
+    fn simulate_structure_ensemble(
+        &self,
+        py:             Python<'_>,
+        sequence:       &str,
+        checkpoint_nts: Vec<usize>,
+        start:          Option<&str>,
+        t_ext:          Option<f64>,
+        t_end:          f64,
+        num_sims:       usize,
+        num_workers:    usize,
+    ) -> PyResult<PyObject> {
+        let results = py.allow_threads(|| {
+            self.inner.simulate_structure_ensemble(
+                sequence, checkpoint_nts, start, t_ext, t_end, num_sims, num_workers,
+            )
+        }).map_err(PyValueError::new_err)?;
+
+        let list = PyList::empty_bound(py);
+        for (nuc, structures) in results {
+            let dict = PyDict::new_bound(py);
+            dict.set_item("nucleotide", nuc)?;
+            dict.set_item("structures", structures)?;
+            list.append(dict)?;
+        }
+        Ok(list.to_object(py))
     }
 
     // -----------------------------------------------------------------------
@@ -227,6 +287,71 @@ impl MotifCheckSimulator {
     ) -> PyResult<f64> {
         py.allow_threads(|| {
             self.inner.cotrans_score(sequence, &config.inner)
+        }).map_err(PyValueError::new_err)
+    }
+
+    // -----------------------------------------------------------------------
+    // cotrans_score_batch — score a list of sequences in parallel (Rayon)
+    // -----------------------------------------------------------------------
+
+    #[pyo3(signature = (sequences, config))]
+    fn cotrans_score_batch(
+        &self,
+        py:        Python<'_>,
+        sequences: Vec<String>,
+        config:    &PyCotransConfig,
+    ) -> PyResult<Vec<f64>> {
+        let inner = &self.inner;
+        let cfg   = &config.inner;
+        py.allow_threads(|| {
+            sequences.par_iter()
+                .map(|seq| inner.cotrans_score(seq, cfg))
+                .collect::<Result<Vec<f64>, String>>()
+        }).map_err(PyValueError::new_err)
+    }
+
+    // -----------------------------------------------------------------------
+    // cotrans_score_both — single simulation, returns (dist_score, occ_score)
+    // -----------------------------------------------------------------------
+
+    /// Score a sequence against both the distance and occupancy objectives
+    /// using a **single** simulation pass. Returns ``(dist_score, occ_score)``,
+    /// each in ``[0, 1]`` (lower is better). The simulation uses distance-based
+    /// early exit; occupancy is computed from the same ``TimecourseResults``.
+    ///
+    /// Use this instead of calling ``cotrans_score`` twice when you need both
+    /// components (e.g. a combined objective ``alpha * dist + (1-alpha) * occ``).
+    #[pyo3(signature = (sequence, config))]
+    fn cotrans_score_both(
+        &self,
+        py:       Python<'_>,
+        sequence: &str,
+        config:   &PyCotransConfig,
+    ) -> PyResult<(f64, f64)> {
+        py.allow_threads(|| {
+            self.inner.cotrans_score_both(sequence, &config.inner)
+        }).map_err(PyValueError::new_err)
+    }
+
+    // -----------------------------------------------------------------------
+    // cotrans_score_both_batch — parallel batch version of cotrans_score_both
+    // -----------------------------------------------------------------------
+
+    /// Parallel batch version of ``cotrans_score_both``.
+    /// Returns a list of ``(dist_score, occ_score)`` tuples, one per sequence.
+    #[pyo3(signature = (sequences, config))]
+    fn cotrans_score_both_batch(
+        &self,
+        py:        Python<'_>,
+        sequences: Vec<String>,
+        config:    &PyCotransConfig,
+    ) -> PyResult<Vec<(f64, f64)>> {
+        let inner = &self.inner;
+        let cfg   = &config.inner;
+        py.allow_threads(|| {
+            sequences.par_iter()
+                .map(|seq| inner.cotrans_score_both(seq, cfg))
+                .collect::<Result<Vec<(f64, f64)>, String>>()
         }).map_err(PyValueError::new_err)
     }
 

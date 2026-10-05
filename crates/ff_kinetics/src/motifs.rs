@@ -163,6 +163,18 @@ impl Motif {
         return dist_counter;
     }
 
+    /// Maximum possible distance for this motif.
+    /// Each Pair constraint contributes 2 (both partners wrong), each X constraint contributes 1.
+    /// Closing ')' positions are not stored in ConstrPosMap, so they contribute 0.
+    pub fn max_distance(&self) -> usize {
+        self.constr_pos_map.0.values()
+            .map(|v| match v {
+                ConstrPos::X       => 1,
+                ConstrPos::Pair(_) => 2,
+            })
+            .sum()
+    }
+
 }
 
 
@@ -355,6 +367,37 @@ pub fn classify(&self, structure: &DotBracketVec) -> Vec<String> {
 
     pub fn energy_model(&self) -> &E {
         self.energy_model.as_ref()
+    }
+
+    /// Classify motifs AND compute distances in one PairTable conversion.
+    /// Returns (match_names, distance_map).
+    /// match_names falls back to ["Unassigned"] if no named motif matches.
+    /// distance_map maps each named motif to its distance from structure.
+    pub fn classify_and_distance(
+        &self,
+        structure:   &DotBracketVec,
+        motif_names: &[String],
+    ) -> (Vec<String>, HashMap<String, usize>) {
+        let structure_pt = PairTable::try_from(structure).unwrap();
+
+        let mut matches:   Vec<String>          = Vec::new();
+        let mut distances: HashMap<String, usize> = HashMap::default();
+
+        for name in motif_names {
+            if let Some(motif) = self.motifs_dict.get(name.as_str()) {
+                distances.insert(name.clone(), motif.distance(&structure_pt));
+                if motif.contains(&structure_pt) {
+                    matches.push(name.clone());
+                }
+            }
+        }
+
+        let final_matches = if matches.is_empty() {
+            vec!["Unassigned".to_string()]
+        } else {
+            matches
+        };
+        (final_matches, distances)
     }
 
     pub fn get(&self, name: &str) -> Option<&Motif> {

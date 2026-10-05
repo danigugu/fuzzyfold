@@ -45,7 +45,15 @@ impl<W: Walker, K: RateModel> SSA<W, K> {
 
     pub fn current_energy(&self) -> i32 {
         self.walker.current_energy()
-    }   
+    }
+
+    /// Add one nucleotide to the RNA and update the rate tree.
+    /// Used to bring the RNA to full length at segment boundaries in
+    /// segmented cotranscriptional simulations.
+    pub fn apply_extension(&mut self) {
+        let (old, new) = self.walker.apply_extension();
+        self.update_rate_tree(old, new);
+    }
 
     pub fn co_simulate<R, F>(
         &mut self,
@@ -65,10 +73,17 @@ impl<W: Walker, K: RateModel> SSA<W, K> {
 
         let mut gtime = 0.0;
         for (idx, &time) in times.iter().enumerate() {
-            // Wrap the user callback
-            let mut co_callback = |t: f64, tinc: f64, 
+            // Subtle fix: if the sampled tinc overshoots the remaining window,
+            // clamp it before passing to the caller. Without this, a caller
+            // computing time-weighted statistics (e.g. occupancy integrals)
+            // would record the molecule as having spent far more than `time`
+            // seconds at its current structure — one tick before the next
+            // nucleotide is added. The epsilon allows callers to detect the
+            // window boundary without being locked out of that last moment.
+            let eps = time / 1000.0;
+            let mut co_callback = |t: f64, tinc: f64,
                 rsum: f64, w: &W| {
-                    callback(t + gtime, tinc, rsum, w)
+                    callback(t + gtime, tinc.min(time - t + eps), rsum, w)
             };
             let cb = self.simulate(rng, time, &mut co_callback);
 
